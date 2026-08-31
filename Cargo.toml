@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mcp-rt",
+    "crates/wm-core",
+    "crates/wm-installer-mcp",
+    "crates/wm-sum-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+mcp-rt = { path = "crates/mcp-rt" }
+wm-core = { path = "crates/wm-core" }
+
+anyhow = "1"
+base64 = "0.22"
+libc = "0.2"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[profile.release]
+strip = true
+lto = "thin"

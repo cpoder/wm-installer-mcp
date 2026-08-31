@@ -1,0 +1,25 @@
+[package]
+name = "wm-core"
+description = "Native client and domain model for IBM webMethods installation: download protocol, product catalog, dependency closure, install engine, inventory and diagnostics."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+getrandom = "0.4.3"
+hmac = "0.13.0"
+md-5 = "0.11"
+pbkdf2 = "0.13.0"
+postgres = "0.19.14"
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.11"
+thiserror = { workspace = true }
+ureq = { version = "3", features = ["json"] }
+zip = { version = "7", default-features = false, features = ["deflate"] }
+
+[target."cfg(unix)".dependencies]
+libc = { workspace = true }

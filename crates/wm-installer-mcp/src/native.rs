@@ -1,0 +1,767 @@
+//! Native tools: talk to IBM directly, no shipped installer involved.
+
+use std::path::{Path, PathBuf};
+
+use mcp_rt::args::{flag, opt_str, opt_usize, req_str, str_list};
+use mcp_rt::{Tool, ToolError, ToolResult};
+use serde_json::{json, Value};
+use wm_core::sdc::{self, Session};
+use wm_core::tree::ProductTree;
+use wm_core::{deps, install, instance, profile, runner};
+
+/// Where fetched product trees and artifacts are kept between calls.
+fn state_dir() -> PathBuf {
+    std::env::var("WM_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            Path::new(&home).join(".wm-mcp")
+        })
+}
+
+fn jobs_dir() -> PathBuf {
+    std::env::var("WM_JOBS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| state_dir().join("jobs"))
+}
+
+fn credentials() -> Result<(String, String), ToolError> {
+    let user = std::env::var("WM_EMPOWER_USER")
+        .map_err(|_| ToolError::invalid("WM_EMPOWER_USER is not set"))?;
+    let key = std::env::var("WM_EMPOWER_KEY")
+        .map_err(|_| ToolError::invalid("WM_EMPOWER_KEY is not set"))?;
+    Ok((user, key))
+}
+
+fn host(args: &Value) -> String {
+    opt_str(args, "host")
+        .or_else(|| std::env::var("WM_SDC_HOST").ok())
+        .unwrap_or_else(|| sdc::DEFAULT_HOST.to_string())
+}
+
+fn login(args: &Value) -> Result<Session, ToolError> {
+    let (user, key) = credentials()?;
+    Session::login(&host(args), &user, &key).map_err(ToolError::failed)
+}
+
+/// Cache path for one release/platform tree.
+fn tree_path(sandbox: &str, platform: &str) -> PathBuf {
+    state_dir()
+        .join("catalog")
+        .join(format!("{sandbox}-{platform}.tree"))
+}
+
+/// Load a cached tree, or fetch and cache it.
+fn tree_for(
+    args: &Value,
+    release: &str,
+    platform: &str,
+) -> Result<(ProductTree, String), ToolError> {
+    let session = login(args)?;
+    let releases = session.releases().map_err(ToolError::failed)?;
+    let entry = releases
+        .iter()
+        .find(|r| r.release == release)
+        .ok_or_else(|| ToolError::failed(format!("no entitlement for release {release}")))?;
+    let sandbox = entry
+        .sandbox()
+        .ok_or_else(|| ToolError::failed(format!("release {release} names no sandbox")))?;
+
+    let cached = tree_path(&sandbox, platform);
+    let text = if cached.is_file() && !flag(args, "refresh", false) {
+        std::fs::read_to_string(&cached)
+            .map_err(|e| ToolError::failed(format!("cannot read the cached tree: {e}")))?
+    } else {
+        let fetched = session
+            .product_tree(&sandbox, platform)
+            .map_err(ToolError::failed)?;
+        if let Some(parent) = cached.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&cached, &fetched);
+        fetched
+    };
+    let tree = ProductTree::parse(&text).map_err(ToolError::failed)?;
+    Ok((tree, sandbox))
+}
+
+/// Releases this account may install.
+pub fn sdc_releases() -> Tool {
+    Tool::new(
+        "sdc_releases",
+        "List the webMethods releases this IBM account is entitled to install, straight from \
+         the download centre. Needs WM_EMPOWER_USER and WM_EMPOWER_KEY; no installer binary \
+         and no existing installation.",
+        json!({ "type": "object", "properties": { "host": { "type": "string" } } }),
+        Box::new(|args| {
+            let session = login(args)?;
+            let releases = session.releases().map_err(ToolError::failed)?;
+            let rows: Vec<Value> = releases
+                .iter()
+                .map(|r| {
+                    json!({
+                        "release": r.release,
+                        "display_name": r.display_name,
+                        "code": r.code,
+                        "sandbox": r.sandbox(),
+                        "repository": r.repository(),
+                    })
+                })
+                .collect();
+            Ok(ToolResult::structured(
+                format!(
+                    "{} entitled release(s): {}",
+                    releases.len(),
+                    releases
+                        .iter()
+                        .map(|r| r.release.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                json!({ "releases": rows }),
+            ))
+        }),
+    )
+}
+
+/// Fetch the product catalogue for a release.
+pub fn sdc_catalog() -> Tool {
+    Tool::new(
+        "sdc_catalog",
+        "Fetch the product tree for one release and platform from IBM and cache it. This is \
+         the authoritative catalogue: it carries the exact versioned product paths, the \
+         prerequisites, and every artifact with its size and sha256 — so no reference \
+         installation is needed, and products absent from a local tree (webMethods Flat File, \
+         for one) are present here.",
+        json!({
+            "type": "object",
+            "required": ["release"],
+            "properties": {
+                "release": { "type": "string", "description": "e.g. 12.1" },
+                "platform": { "type": "string", "description": "LNXAMD64 (default), W64, AIX, SOLAMD64, LNXS390X." },
+                "refresh": { "type": "boolean", "description": "Re-fetch even if cached." },
+                "query": { "type": "string", "description": "Only return products matching this substring." },
+                "limit": { "type": "integer" },
+                "host": { "type": "string" }
+            }
+        }),
+        Box::new(|args| {
+            let release = req_str(args, "release")?;
+            let platform = opt_str(args, "platform").unwrap_or_else(|| "LNXAMD64".into());
+            let (tree, sandbox) = tree_for(args, &release, &platform)?;
+            let catalog = tree.catalog();
+
+            let matches: Vec<Value> = match opt_str(args, "query") {
+                Some(query) => {
+                    let needle = query.to_lowercase();
+                    catalog
+                        .iter()
+                        .filter(|p| {
+                            p.path.component.to_lowercase().contains(&needle)
+                                || p.path.group.to_lowercase().contains(&needle)
+                                || p.path.code().to_lowercase().contains(&needle)
+                        })
+                        .take(opt_usize(args, "limit").unwrap_or(50))
+                        .map(|p| {
+                            json!({
+                                "path": p.path.raw,
+                                "component": p.path.component,
+                                "group": p.path.group,
+                                "version": p.path.version(),
+                                "requires": p.requires,
+                            })
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            let total: u64 = tree
+                .artifacts()
+                .iter()
+                .filter_map(|a| a.compressed_size)
+                .sum();
+            Ok(ToolResult::structured(
+                format!(
+                    "{release} ({sandbox}/{platform}): {} products, {} artifacts, {:.1} GB in full",
+                    tree.product_count(),
+                    tree.artifacts().len(),
+                    total as f64 / 1e9
+                ),
+                json!({
+                    "release": release,
+                    "sandbox": sandbox,
+                    "platform": platform,
+                    "products": tree.product_count(),
+                    "artifacts": tree.artifacts().len(),
+                    "matches": matches,
+                    "cache": tree_path(&sandbox, &platform),
+                }),
+            ))
+        }),
+    )
+}
+
+/// Resolve a selection and price the download.
+pub fn native_plan() -> Tool {
+    Tool::new(
+        "native_plan",
+        "Resolve a product selection against IBM's catalogue and report exactly what would be \
+         downloaded and installed: the prerequisite closure, the artifact list with its total \
+         size, and — importantly — which products declare Java install panels that a native \
+         install cannot run.",
+        json!({
+            "type": "object",
+            "required": ["release", "products"],
+            "properties": {
+                "release": { "type": "string" },
+                "platform": { "type": "string" },
+                "products": { "type": "array", "items": { "type": "string" }, "description": "Component names or full versioned paths." },
+                "include_mandatory": { "type": "boolean", "description": "Inject the undeclared base products (default true)." },
+                "host": { "type": "string" }
+            }
+        }),
+        Box::new(|args| {
+            let release = req_str(args, "release")?;
+            let platform = opt_str(args, "platform").unwrap_or_else(|| "LNXAMD64".into());
+            let (tree, _) = tree_for(args, &release, &platform)?;
+            let catalog = tree.catalog();
+
+            let mut seeds = Vec::new();
+            let mut unknown = Vec::new();
+            for wanted in str_list(args, "products") {
+                match catalog
+                    .get(&wanted)
+                    .map(|_| wanted.clone())
+                    .or_else(|| catalog.path_of(&wanted).map(|p| p.raw.clone()))
+                {
+                    Some(path) => seeds.push(path),
+                    None => unknown.push(wanted),
+                }
+            }
+            if seeds.is_empty() {
+                return Err(ToolError::invalid(
+                    "none of the requested products exist in the catalogue",
+                ));
+            }
+            let resolution = deps::resolve(&catalog, &seeds, flag(args, "include_mandatory", true))
+                .map_err(ToolError::failed)?;
+            let paths = resolution.paths();
+            let plan = install::plan(&tree, &paths);
+
+            let mut summary = format!(
+                "{} products ({} after closure), {} artifacts, {:.2} GB to download",
+                seeds.len(),
+                plan.products.len(),
+                plan.artifacts.len(),
+                plan.download_bytes as f64 / 1e9
+            );
+            if !plan.products_with_panels.is_empty() {
+                summary.push_str(&format!(
+                    "; {} product(s) declare install panels a native install does not run",
+                    plan.products_with_panels.len()
+                ));
+            }
+            Ok(ToolResult::structured(
+                summary,
+                json!({
+                    "complete": resolution.unsatisfied.is_empty() && unknown.is_empty(),
+                    "unknown_products": unknown,
+                    "unsatisfied": resolution.unsatisfied,
+                    "products": paths,
+                    "artifact_count": plan.artifacts.len(),
+                    "download_bytes": plan.download_bytes,
+                    "expanded_bytes": plan.expanded_bytes,
+                    "products_with_panels": plan.products_with_panels,
+                }),
+            ))
+        }),
+    )
+}
+
+/// Run a native install as a detached job.
+pub fn native_install() -> Tool {
+    Tool::new(
+        "native_install",
+        "Download and install a product selection straight from IBM: no installer binary, no \
+         JVM, no image. Every artifact is verified against the sha256 the catalogue declares \
+         before it is unpacked, and the installation is left self-describing \
+         (install/bms/*.contents, install/products/*.prop). Returns a job id — poll it with \
+         job_status. Java install panels are not run; see native_plan.",
+        json!({
+            "type": "object",
+            "required": ["release", "products", "install_dir"],
+            "properties": {
+                "release": { "type": "string" },
+                "platform": { "type": "string" },
+                "products": { "type": "array", "items": { "type": "string" } },
+                "install_dir": { "type": "string" },
+                "include_mandatory": { "type": "boolean" },
+                "host": { "type": "string" }
+            }
+        }),
+        Box::new(|args| {
+            // Validate the plan before spawning: a job that fails on its first
+            // call has cost a process and told the caller nothing new.
+            let release = req_str(args, "release")?;
+            let install_dir = req_str(args, "install_dir")?;
+            let platform = opt_str(args, "platform").unwrap_or_else(|| "LNXAMD64".into());
+            credentials()?;
+            let (tree, _) = tree_for(args, &release, &platform)?;
+            let catalog = tree.catalog();
+            let mut seeds = Vec::new();
+            for wanted in str_list(args, "products") {
+                if let Some(path) = catalog
+                    .get(&wanted)
+                    .map(|_| wanted.clone())
+                    .or_else(|| catalog.path_of(&wanted).map(|p| p.raw.clone()))
+                {
+                    seeds.push(path);
+                }
+            }
+            if seeds.is_empty() {
+                return Err(ToolError::invalid(
+                    "none of the requested products exist in the catalogue",
+                ));
+            }
+            let resolution = deps::resolve(&catalog, &seeds, flag(args, "include_mandatory", true))
+                .map_err(ToolError::failed)?;
+
+            let spec = json!({
+                "release": release,
+                "platform": platform,
+                "install_dir": install_dir,
+                "products": resolution.paths(),
+                "host": host(args),
+            });
+            let jobs = jobs_dir();
+            std::fs::create_dir_all(&jobs)
+                .map_err(|e| ToolError::failed(format!("cannot create {}: {e}", jobs.display())))?;
+            let spec_path = jobs.join(format!("install-spec-{}.json", std::process::id()));
+            std::fs::write(&spec_path, spec.to_string())
+                .map_err(|e| ToolError::failed(format!("cannot write the job spec: {e}")))?;
+
+            let me = std::env::current_exe()
+                .map_err(|e| ToolError::failed(format!("cannot locate this executable: {e}")))?;
+            let env = runner::Environment {
+                // Credentials stay in this process's environment and are
+                // inherited by the job; nothing is written to the wrapper.
+                passthrough: vec!["WM_EMPOWER_USER".into(), "WM_EMPOWER_KEY".into()],
+                ..runner::Environment::default()
+            };
+            let job = runner::spawn(
+                &jobs,
+                "native",
+                &me,
+                &["--install-job".to_string(), spec_path.display().to_string()],
+                &env,
+            )
+            .map_err(ToolError::failed)?;
+            Ok(ToolResult::structured(
+                format!("native install started as {} into {install_dir}", job.id),
+                json!({ "job_id": job.id, "log": job.log, "products": resolution.len() }),
+            ))
+        }),
+    )
+}
+
+/// Create an Integration Server instance.
+pub fn instance_create() -> Tool {
+    Tool::new(
+        "instance_create",
+        "Create an Integration Server instance natively — the step the shipped installer's          Java panel performs. Unpacks the instance template with the platform filters the          product's own Ant file applies, copies the core packages, writes config/server.cnf,          bin/setenv_instance.sh and the wrapper configuration, and seeds the administrator          password in the format the server checks against          (PBKDF2-HMAC-SHA256, 600 000 iterations, salted). No JVM involved.",
+        json!({
+            "type": "object",
+            "required": ["wm_home"],
+            "properties": {
+                "wm_home": { "type": "string", "description": "Installation root." },
+                "name": { "type": "string", "description": "Instance name (default \"default\")." },
+                "primary_port": { "type": "integer", "description": "HTTP port, default 5555." },
+                "secure_port": { "type": "integer", "description": "HTTPS port, default 5543." },
+                "diagnostic_port": { "type": "integer", "description": "Default 9999." },
+                "jmx_port": { "type": "integer", "description": "JMX port the service wrapper exposes, default 8075." },
+                "bind_address": { "type": "string", "description": "Interface to bind; every interface when omitted." },
+                "admin_password": { "type": "string", "description": "Administrator password. Without it the instance has no usable credential." },
+                "change_password_on_login": { "type": "boolean" },
+                "packages": { "type": "array", "items": { "type": "string" }, "description": "Packages to copy in beyond the core set." }
+            }
+        }),
+        Box::new(|args| {
+            let wm_home = PathBuf::from(req_str(args, "wm_home")?);
+            let spec = instance::InstanceSpec {
+                name: opt_str(args, "name").unwrap_or_else(|| "default".into()),
+                primary_port: port(args, "primary_port", 5555)?,
+                secure_port: port(args, "secure_port", 5543)?,
+                diagnostic_port: port(args, "diagnostic_port", 9999)?,
+                jmx_port: port(args, "jmx_port", 8075)?,
+                bind_address: opt_str(args, "bind_address").unwrap_or_default(),
+                lock_mode: "full".into(),
+                admin_password: opt_str(args, "admin_password"),
+                change_password_on_login: flag(args, "change_password_on_login", false),
+                extra_packages: str_list(args, "packages"),
+            };
+            let created = instance::create(&wm_home, &spec).map_err(ToolError::failed)?;
+            let mut summary = format!(
+                "instance {} created at {}: {} template files, {} package(s), {} config file(s)",
+                spec.name,
+                created.path.display(),
+                created.template_files,
+                created.packages.len(),
+                created.wrote.len()
+            );
+            if !created.skipped.is_empty() {
+                summary.push_str(&format!("; {} caveat(s)", created.skipped.len()));
+            }
+            Ok(ToolResult::structured(
+                summary,
+                json!({
+                    "path": created.path,
+                    "template_files": created.template_files,
+                    "packages": created.packages,
+                    "wrote": created.wrote,
+                    "skipped": created.skipped,
+                    "ports": {
+                        "primary": spec.primary_port,
+                        "secure": spec.secure_port,
+                        "diagnostic": spec.diagnostic_port,
+                    },
+                }),
+            ))
+        }),
+    )
+}
+
+/// Capture a p2 profile for replay elsewhere.
+pub fn profile_capture() -> Tool {
+    Tool::new(
+        "profile_capture",
+        "Capture an Eclipse p2 profile (Platform Manager, My webMethods Server) into a small          portable archive: the bundle list and the configuration, with installation paths          replaced by placeholders. The bundle jars are not carried — every one of them comes          from the installation's own repositories, so a replay copies them locally. Building a          profile from scratch needs a p2 director; replaying a known-good one does not.",
+        json!({
+            "type": "object",
+            "required": ["wm_home", "profile", "output"],
+            "properties": {
+                "wm_home": { "type": "string", "description": "Installation to capture from." },
+                "profile": { "type": "string", "description": "Profile name, e.g. SPM or MWS_default." },
+                "output": { "type": "string", "description": "Archive to write." }
+            }
+        }),
+        Box::new(|args| {
+            let wm_home = PathBuf::from(req_str(args, "wm_home")?);
+            let name = req_str(args, "profile")?;
+            let output = PathBuf::from(req_str(args, "output")?);
+            let manifest =
+                profile::capture(&wm_home, &name, &output).map_err(ToolError::failed)?;
+            let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+            Ok(ToolResult::structured(
+                format!(
+                    "captured {name}: {} bundles, {} config file(s), {:.1} MB at {}",
+                    manifest.bundles.len(),
+                    manifest.files.len(),
+                    size as f64 / 1e6,
+                    output.display()
+                ),
+                json!({
+                    "output": output,
+                    "profile": manifest.name,
+                    "bundles": manifest.bundles.len(),
+                    "files": manifest.files.len(),
+                    "tokenised": manifest.tokenised.len(),
+                    "bytes": size,
+                }),
+            ))
+        }),
+    )
+}
+
+/// Replay a captured profile onto an installation.
+pub fn profile_replay() -> Tool {
+    Tool::new(
+        "profile_replay",
+        "Lay a captured p2 profile down on an installation, resolving its bundles from that          installation's own repositories and substituting its paths. Dry run by default. A          bundle the capture names but the target does not carry is reported, not guessed: the          profile would not start, and saying so is more useful than a partial one.",
+        json!({
+            "type": "object",
+            "required": ["capture", "wm_home"],
+            "properties": {
+                "capture": { "type": "string", "description": "Archive from profile_capture." },
+                "wm_home": { "type": "string", "description": "Installation to write into." },
+                "profile": { "type": "string", "description": "Name to give it; the captured name by default." },
+                "apply": { "type": "boolean", "description": "Set true to write; otherwise a dry run." }
+            }
+        }),
+        Box::new(|args| {
+            let capture = PathBuf::from(req_str(args, "capture")?);
+            let wm_home = PathBuf::from(req_str(args, "wm_home")?);
+            let name = opt_str(args, "profile");
+            let dry_run = !flag(args, "apply", false);
+            let done = profile::replay(&capture, &wm_home, name.as_deref(), dry_run)
+                .map_err(ToolError::failed)?;
+            let mut summary = format!(
+                "{}: {} bundle(s) resolved, {} file(s) at {}",
+                if dry_run { "dry run" } else { "replayed" },
+                done.bundles,
+                done.files,
+                done.path.display()
+            );
+            if !done.missing_bundles.is_empty() {
+                summary
+                    .push_str(&format!("; {} bundle(s) missing", done.missing_bundles.len()));
+            }
+            Ok(ToolResult::structured(summary, json!({ "result": done })))
+        }),
+    )
+}
+
+/// Read a port argument, refusing a value that cannot be one.
+fn port(args: &Value, key: &str, default: u16) -> Result<u16, ToolError> {
+    match args.get(key).and_then(Value::as_u64) {
+        None => Ok(default),
+        Some(n) if n >= 1 && n <= u16::MAX as u64 => Ok(n as u16),
+        Some(n) => Err(ToolError::invalid(format!(
+            "{key} must be 1..65535, got {n}"
+        ))),
+    }
+}
+
+/// Perform the install described by `spec_path`. Entry point for the job process.
+pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(spec_path).map_err(|e| e.to_string())?;
+    let spec: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let get = |k: &str| {
+        spec.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let (user, key) = (
+        std::env::var("WM_EMPOWER_USER").map_err(|_| "WM_EMPOWER_USER is not set".to_string())?,
+        std::env::var("WM_EMPOWER_KEY").map_err(|_| "WM_EMPOWER_KEY is not set".to_string())?,
+    );
+    let host = get("host");
+    let release_wanted = get("release");
+    let platform = get("platform");
+    let install_dir = PathBuf::from(get("install_dir"));
+    let products: Vec<String> = spec
+        .get("products")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    println!("authenticating against {host}");
+    let mut session = Session::login(&host, &user, &key).map_err(|e| e.to_string())?;
+    let releases = session.releases().map_err(|e| e.to_string())?;
+    let release = releases
+        .iter()
+        .find(|r| r.release == release_wanted)
+        .ok_or_else(|| format!("no entitlement for release {release_wanted}"))?;
+    let sandbox = release.sandbox().ok_or("release names no sandbox")?;
+    let repository = release.repository().ok_or("release names no repository")?;
+    let cgi = release.cgi().ok_or("release names no CGI")?.to_string();
+
+    let cached = tree_path(&sandbox, &platform);
+    let text = match std::fs::read_to_string(&cached) {
+        Ok(text) => text,
+        Err(_) => session
+            .product_tree(&sandbox, &platform)
+            .map_err(|e| e.to_string())?,
+    };
+    let tree = ProductTree::parse(&text).map_err(|e| e.to_string())?;
+
+    let artifacts = tree.artifacts_for_selection(products.iter().map(String::as_str));
+    let total: u64 = artifacts.iter().filter_map(|a| a.compressed_size).sum();
+    println!(
+        "{} products, {} artifacts, {:.2} GB to fetch into {}",
+        products.len(),
+        artifacts.len(),
+        total as f64 / 1e9,
+        install_dir.display()
+    );
+    std::fs::create_dir_all(&install_dir).map_err(|e| e.to_string())?;
+    let cache = state_dir().join("artifacts").join(&sandbox);
+
+    let mut done = 0usize;
+    let mut bytes = 0u64;
+    for artifact in &artifacts {
+        let fetched = install::fetch(&mut session, &cgi, &repository, artifact, &cache)
+            .map_err(|e| e.to_string())?;
+        let modes = install::Modes::read(&fetched.path).map_err(|e| e.to_string())?;
+        let unpacked =
+            install::unpack(&fetched.path, &install_dir, &modes).map_err(|e| e.to_string())?;
+        install::write_contents(&install_dir, artifact, &unpacked).map_err(|e| e.to_string())?;
+        done += 1;
+        bytes += fetched.size;
+        println!(
+            "[{done}/{}] {} {} -> {} file(s)",
+            artifacts.len(),
+            if fetched.from_cache {
+                "cached"
+            } else {
+                "fetched"
+            },
+            artifact.name,
+            unpacked.files.len()
+        );
+    }
+    for product in &products {
+        install::write_prop(&install_dir, product, &tree).map_err(|e| e.to_string())?;
+    }
+    println!("installed {done} artifact(s), {:.2} GB", bytes as f64 / 1e9);
+
+    let panels: Vec<&String> = products
+        .iter()
+        .filter(|p| !tree.panels_for(p).is_empty())
+        .collect();
+    if !panels.is_empty() {
+        println!(
+            "note: {} product(s) declare Java install panels that were not run; \
+             instance creation and administrator-password seeding are not done",
+            panels.len()
+        );
+    }
+    Ok(())
+}
+
+/// Report the database components an installation ships and what installing
+/// them would do.
+pub fn database_plan() -> Tool {
+    Tool::new(
+        "database_plan",
+        "Report the database components an installation ships, and for each one the create \
+         script set and the chain of migrations that would bring it to its newest version. \
+         This is what `common/db/bin/dbConfigurator.sh` decides, without the JVM — and unlike \
+         that tool it reports the plan before touching anything. Components that ship no \
+         scripts for the chosen database are listed with the databases they do support.",
+        json!({
+            "type": "object",
+            "required": ["wm_home"],
+            "properties": {
+                "wm_home": { "type": "string", "description": "Installation to inspect." },
+                "database": { "type": "string", "description": "postgresql, oracle, sqlserver, db2, mysql or sybase (default postgresql)." },
+                "components": { "type": "array", "items": { "type": "string" }, "description": "Component names; default every component found." }
+            }
+        }),
+        Box::new(|args| {
+            let home = PathBuf::from(req_str(args, "wm_home")?);
+            let database = opt_str(args, "database").unwrap_or_else(|| "postgresql".into());
+            let wanted = str_list(args, "components");
+            let components = wm_core::database::discover(&home).map_err(ToolError::failed)?;
+
+            let mut plans = Vec::new();
+            let mut unsupported = Vec::new();
+            for component in &components {
+                if !wanted.is_empty() && !wanted.contains(&component.name) {
+                    continue;
+                }
+                match wm_core::database::plan(component, &database) {
+                    Ok(plan) => plans.push(plan),
+                    Err(_) => unsupported.push(json!({
+                        "component": component.name,
+                        "code": component.code,
+                        "ships": wm_core::database::databases(component)
+                            .into_iter().collect::<Vec<_>>(),
+                    })),
+                }
+            }
+            let scripts: usize = plans.iter().map(|p| p.scripts.len()).sum();
+            let summary = format!(
+                "{} component(s) installable for {database}, {scripts} script(s) in total; \
+                 {} ship no {database} scripts",
+                plans.len(),
+                unsupported.len()
+            );
+            Ok(ToolResult::structured(
+                summary,
+                json!({ "plans": plans, "unsupported": unsupported }),
+            ))
+        }),
+    )
+}
+
+/// Create database schemas.
+pub fn database_configure() -> Tool {
+    Tool::new(
+        "database_configure",
+        "Create the database schemas a product needs, natively — no JVM, no JDBC drivers, no \
+         dbConfigurator.sh. Runs each component's create set and then its migration chain, one \
+         transaction per script, and records the INSTALL event in COMPONENT_EVENT that every \
+         webMethods product reads to learn what level its schema is at. ComponentTracker is \
+         always installed first because nothing can be recorded without it. Defaults to a dry \
+         run. PostgreSQL only for now: the plan is computed for any database, but only \
+         PostgreSQL is executed here.",
+        json!({
+            "type": "object",
+            "required": ["wm_home", "components", "host", "database_name", "user", "password"],
+            "properties": {
+                "wm_home": { "type": "string", "description": "Installation whose scripts to use." },
+                "components": { "type": "array", "items": { "type": "string" }, "description": "Component names, e.g. TradingNetworks." },
+                "host": { "type": "string" },
+                "port": { "type": "integer", "description": "Default 5432." },
+                "database_name": { "type": "string", "description": "The database to install into; it must already exist." },
+                "user": { "type": "string" },
+                "password": { "type": "string" },
+                "apply": { "type": "boolean", "description": "Set true to write; otherwise a dry run." }
+            }
+        }),
+        Box::new(|args| {
+            let home = PathBuf::from(req_str(args, "wm_home")?);
+            let wanted = str_list(args, "components");
+            if wanted.is_empty() {
+                return Err(ToolError::invalid("name at least one component"));
+            }
+            let target = wm_core::database::Target {
+                host: req_str(args, "host")?,
+                port: args.get("port").and_then(|p| p.as_u64()).unwrap_or(5432) as u16,
+                database: req_str(args, "database_name")?,
+                user: req_str(args, "user")?,
+                password: req_str(args, "password")?,
+            };
+            let components = wm_core::database::discover(&home).map_err(ToolError::failed)?;
+
+            // Prerequisites are pulled in and everything is ordered: the
+            // components are not independent, and installing them in the order
+            // they were asked for only works if the caller already knew it.
+            let order =
+                wm_core::database::order(&components, &wanted).map_err(ToolError::failed)?;
+
+            let mut client = wm_core::database::connect(&target).map_err(ToolError::failed)?;
+            let installed = wm_core::database::installed(&mut client).map_err(ToolError::failed)?;
+            let dry_run = !flag(args, "apply", false);
+
+            let mut done = Vec::new();
+            for component in order {
+                let plan =
+                    wm_core::database::plan(component, "postgresql").map_err(ToolError::failed)?;
+                let already = installed.get(&plan.code).map(String::as_str);
+                if dry_run {
+                    done.push(json!({
+                        "component": plan.component,
+                        "code": plan.code,
+                        "from": already,
+                        "to": plan.target,
+                        "scripts": plan.scripts.len(),
+                        "skipped": already == Some(plan.target.as_str()),
+                    }));
+                    continue;
+                }
+                let applied = wm_core::database::apply(&mut client, &plan, already)
+                    .map_err(ToolError::failed)?;
+                done.push(serde_json::to_value(&applied).unwrap_or(json!({})));
+            }
+
+            let summary = format!(
+                "{}: {} component(s) on {}/{}",
+                if dry_run { "dry run" } else { "configured" },
+                done.len(),
+                target.host,
+                target.database
+            );
+            Ok(ToolResult::structured(
+                summary,
+                json!({ "components": done }),
+            ))
+        }),
+    )
+}

@@ -1,0 +1,11 @@
+[package]
+name = "wm-installer-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mcp-rt = { workspace = true }
+wm-core = { workspace = true }
+serde_json = { workspace = true }
