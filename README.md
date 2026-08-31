@@ -117,8 +117,8 @@ account.
   wizard's `ISMultiInstancePanel` does.
 - `profile_capture`, `profile_replay` — carry an Eclipse p2 profile between
   installations as a ~3 MB archive instead of a 218 MB directory.
-- `database_plan`, `database_configure` — install database schemas by running
-  the product's own SQL, replacing `dbConfigurator.sh`.
+- `database_plan`, `database_configure` — **run the product's own table-creation
+  scripts**, replacing `dbConfigurator.sh`. See below.
 - `script_generate`, `script_validate`, `install_run`, `image_build` — drive the
   shipped installer too, when you want to.
 - `inventory_read`, `plan_resolve`, `diagnose_log`, `job_status`.
@@ -133,6 +133,40 @@ account.
 - `fixes_installed`, `fix_script_generate`, `fix_run`, `sum_locks`,
   `sum_result`, `diagnose_log`, `job_status` — drive Update Manager when needed,
   including clearing the stale lock behind its silent `211`.
+
+## Database schemas: the product's scripts, executed — never reinvented
+
+Trading Networks does not run without its schemas, and `dbConfigurator.sh` is a
+shell wrapper around `com.webmethods.dcc.cli.Main` — a JVM, a dozen jars and a
+set of JDBC drivers. `database_configure` replaces the wrapper, **not the SQL**.
+
+The distinction matters, so to be unambiguous: **no DDL is compiled into these
+binaries.** Every table, index, view and constraint comes from the product's own
+`.sql` files, read from `common/db/` at run time and executed as shipped. The
+schema stays versioned and patchable by IBM: a fix that ships new scripts is
+picked up with no code change here. The only statement the binary composes
+itself is the `INSERT` recording the install in `COMPONENT_EVENT` — the row
+whose `INSTALLED_COMPONENT` view is how every webMethods product asks what level
+its schema is at.
+
+What it does add is the part `dbConfigurator.sh` performs in Java and never
+shows you:
+
+- **choosing the scripts.** Create sets exist at only a handful of versions —
+  for Trading Networks on PostgreSQL, exactly one, at 10.1. The remaining
+  distance to 12.0 is 21 migrations. So it runs the newest create set, then the
+  *shortest* path through the migration graph.
+- **ordering the components.** They are not independent: `TradingNetworksArchive`
+  declares `preinstall: [TradingNetworks]`, `MywebMethodsServer` needs
+  `TaskEngine` and `CommonDirectoryServices` before it and `CentralConfiguration`
+  after. Prerequisites are pulled in and everything is topologically ordered, so
+  asking for one component installs what it needs.
+- **saying so first.** `database_plan` reports the create set, the migration
+  chain and the script count without touching the database, for *any* engine.
+
+Measured, from an empty PostgreSQL: ComponentTracker, TradingNetworks and
+TradingNetworksArchive — 47 scripts, 408 statements, **0.23 s**, 85 tables.
+Re-running is a no-op.
 
 ## The interesting parts
 
@@ -177,9 +211,6 @@ caveats are.
   batch separator for SQL Server (1192 occurrences). The same character that
   must be *discarded* in their PostgreSQL scripts must be *executed* in their
   Oracle ones. Each engine needs its own statement splitter and its own driver.
-- **The schema is never generated.** Tables come from the product's own `.sql`
-  files, read from disk at run time. Nothing about a schema is compiled into
-  these binaries, so a fix that ships new SQL is picked up with no code change.
 - **Two product panels are not reimplemented**: `TNServerConfigPanel` and
   `PortalStartConfiguratorSerenity`, which configure Trading Networks *inside* an
   instance. Everything else a 12.1 B2B selection declares is either replaced or
