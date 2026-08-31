@@ -1,11 +1,51 @@
 # The lightweight resolver
 
-An alternative to the Eclipse p2 director for computing a profile's bundle set.
-It is not a solver: no SAT, no backtracking, no minimality objective. It walks
-the feature graph and then closes the OSGi wiring greedily.
+## What p2 is, and why it is the bottleneck
 
-Measured against the real p2 director on the same twelve SPM feature roots and
-the same 35 repositories:
+Platform Manager, My webMethods Server and the Command Central runtimes are not
+plain Java processes. Each is an OSGi framework booting from an **Eclipse p2
+profile**: a `configuration/` directory, a `plugins/` directory of several
+hundred jars, and a `bundles.info` listing which bundle is installed, at what
+version, at which start level, and whether it is started. Getting that list
+right is the whole job — the framework does exactly what it says and nothing
+else.
+
+Computing that list is what the **p2 director** does, and it is a genuinely hard
+problem *in general*. Installable units declare requirements with version
+ranges, LDAP environment filters, optional and greedy flags, and singleton
+constraints; a requirement may have many providers; and the director is expected
+to return a *minimal* consistent set. In this metadata, **4,113 requirements
+have more than one provider**. p2 uses a SAT solver, and it needs one.
+
+The cost is not theoretical. On the reference installation, one profile costs
+**30.7 seconds and 401 MB of peak RSS** — and the director does not run once. It
+runs per profile, again when the product mix changes, and again for every fix
+that touches a profile. That is the bulk of "the installer takes forever", and
+it is also why the process is opaque: there is no way to ask the director what
+it is about to do without letting it do it.
+
+## Why it can be replaced here — and what that costs
+
+p2 solves the general case: arbitrary repositories, arbitrary constraints,
+contributed by parties who never met. A webMethods installation is not the
+general case. The repositories ship together, the feature graph is closed and
+vendor-curated, and `feature.xml` — the *definition* layer, as opposed to
+`content.xml`, the *verification* layer where the ambiguity lives — names its
+plugins at exact versions.
+
+So the general solver is doing more work than the actual job requires. Walk the
+feature graph, then close the OSGi wiring greedily. No SAT, no backtracking, no
+minimality objective.
+
+The bargain is explicit: **this is not a solver, and it carries no guarantee on
+a product mix nobody has provisioned before.** It agrees with the director on
+the profiles measured here. On a genuinely novel mix, run the vendor tool once
+and capture the result — which takes 30 seconds, once, ever.
+
+## Measured against the director
+
+Same twelve SPM feature roots, same 35 repositories, the vendor's own director
+on one side and this on the other:
 
 | | p2 director | this resolver |
 |---|---|---|

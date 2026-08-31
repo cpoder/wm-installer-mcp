@@ -29,6 +29,50 @@ automation, and none of it tells you what it is about to do before it does it.
 These servers expose the same operations as MCP tools an agent can call, and
 every destructive one **defaults to a dry run that reports the plan first**.
 
+## The p2 problem
+
+Most of the time a webMethods install spends is not spent copying files.
+
+Platform Manager, My webMethods Server and the Command Central runtimes each
+boot from an **Eclipse p2 profile** — an OSGi framework plus a `bundles.info`
+saying which of several hundred bundles is installed, at what version, at which
+start level, and whether it is started. Computing that list is the job of the
+**p2 director**, and in the general case it is genuinely hard: version ranges,
+LDAP environment filters, optional and greedy flags, singletons, and an
+objective that prefers a minimal consistent set. In this metadata **4,113
+requirements have more than one provider**. p2 uses a SAT solver because it
+needs one.
+
+That costs **30.7 seconds and 401 MB of peak RSS per profile** — and the
+director does not run once. It runs per profile, again when the product mix
+changes, and again for every fix that touches a profile. It is also why the
+process is opaque: there is no way to ask the director what it is about to do
+without letting it do it.
+
+**But a webMethods installation is not the general case.** The repositories ship
+together, the feature graph is closed and vendor-curated, and `feature.xml`
+names its plugins at exact versions. The general solver is doing more work than
+the actual job requires. Walk the feature graph, close the OSGi wiring greedily,
+and you land on the same answer: **496 of 498 bundles identical to the
+director's**, every `started` flag identical, in **1.2 s and 56 MB**. The profile
+it builds boots and serves.
+
+The bargain is explicit, and it is the whole reason this is a *lightweight*
+resolver rather than a replacement: **no SAT, no backtracking, no minimality
+objective, and therefore no guarantee on a product mix nobody has provisioned
+before.** For that case, run the vendor tool once and capture the result — 30
+seconds, once, ever. For every case after that, 1.2 seconds.
+
+The surprise was where the difficulty actually lived. Not in the closure — in
+the metadata. Start levels are in four different places and never in the
+bundle's own installable unit. Platform constraints sit on the requirement
+*edge* in `content.xml` and are absent from `feature.xml` entirely. A profile
+legitimately installs the same bundle at two versions at once. And a fragment is
+never started, which nothing anywhere says. Each of those failed **silently** —
+a framework idling with no HTTP connector and no error naming the cause.
+[`docs/lightweight-resolver.md`](docs/lightweight-resolver.md) has the full
+account.
+
 ## What it does
 
 **`wm-installer-mcp`** — 18 tools

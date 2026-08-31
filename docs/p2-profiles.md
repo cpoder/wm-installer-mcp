@@ -211,62 +211,35 @@ dry run: 94 file(s) would be written, 1 deleted,
 warning: profile SPM looks like it is running; stop it before applying
 ```
 
-## A lighter resolver, if one is ever wanted
+## A lighter resolver — built, and it starts
 
-Replay covers deployment. What it does not cover is a product mix nobody has
-ever provisioned. For that, there is a middle road between "run p2" and "write a
-SAT solver", and it is worth recording because the measurements are encouraging.
+The section above was written before the thing existed. It does now, it works,
+and the design sketched here turned out to be right about the shape and wrong
+about the difficulty.
 
-p2's `content.xml` is a *verification* layer: requirements and capabilities over
-`osgi.bundle`, `java.package` and `org.eclipse.equinox.p2.iu`, which is where the
-ambiguity lives. The features' own `feature.xml` is the *definition* layer, and
-it is exact:
+Right about the shape: `content.xml` is a *verification* layer, where the
+ambiguity lives; `feature.xml` is the *definition* layer and is exact. Walking
+the feature graph and then closing the OSGi wiring greedily does replace the
+solve. Measured head to head against the real p2 director on the same twelve
+roots and the same 35 repositories: **1.2 s against 30.7 s**, 56 MB against
+401 MB, agreeing on **496 of 498 bundles** and on **every** `started` flag. The
+profile it builds serves `/spm/inventory/products` with HTTP 200.
 
-```xml
-<feature id="com.webmethods.plm.spm.asset.feature" version="12.1.0.0000-0417">
-  <requires>
-    <import feature="com.webmethods.repository.lar.registry"
-            version="12.1.0.0000-0000" match="greaterOrEqual"/>
-  </requires>
-  <plugin id="com.webmethods.plm.spm.asset.management" version="12.1.0.0000-0417"/>
-</feature>
-```
+Wrong about the difficulty. The sketch expected the work to be in the closure —
+"a repair pass would close them". The closure was the easy half. What actually
+decided whether the framework came up was metadata archaeology: OSGi version
+ranges and the fact that a profile installs one bundle at two versions at once;
+start levels that live in four places and never in the bundle's own unit;
+platform constraints that sit on the requirement *edge* in `content.xml` and are
+absent from `feature.xml` entirely; and the unwritten rule that a fragment is
+never started. Each of those failed silently — a framework idling with no HTTP
+connector and no error naming the cause.
 
-Plugins are named at an exact version. Feature imports carry a floor and a match
-rule. That is a graph traversal with a deterministic tie-break, not a
-satisfiability problem.
-
-Measured on the real 12.1 metadata, expanding the 12 declared root features of
-the SPM profile:
-
-| | |
-|---|---|
-| features reached | 101 — exactly the 101 group units in the reference profile |
-| plugins named | 487, against 494 actually present |
-| extra | 12 |
-| missing | 19 |
-| plugin references that resolve to no jar | 0 |
-
-One normalisation is needed: features write OSGi versions truncated
-(`version="1.84"` for `bcprov_1.84.0.jar`), so ids must be matched on a padded
-`major.minor.micro`. Platform filters barely matter — only 4 of 1215 plugin
-entries carry an `os`/`ws`/`arch` attribute.
-
-That leaves roughly 3%. The extras are the platform-filtered fragments and the
-bundles that are referenced in place rather than copied; the 19 missing are
-pulled in by capability rather than by any feature. A repair pass would close
-them: read `Import-Package` and `Require-Bundle` from each bundle's own
-`MANIFEST.MF` and add a provider where none is present — resolution over an
-almost-closed set, where each unsatisfied import has an obvious answer, rather
-than a search over an empty one.
-
-It is a plausible design, not a working one, and it should not be built on
-speculation: the honest test is whether the profile it produces starts, the way
-the replayed one above does.
+The full account, with the measurements, is in
+[`lightweight-resolver.md`](lightweight-resolver.md).
 
 ## What is still Update Manager's
 
-* creating a profile from scratch — the solver above;
 * the `osgi*IU` actions, which add or remove installable units;
 * rewriting the p2 profile registry. A fix applied here changes `bundles.info`
   and the jars, which is what the runtime reads; the registry still describes
