@@ -4,16 +4,43 @@ Two MCP servers that install, provision and patch IBM webMethods 12.1 **without
 the shipped installer, without Update Manager, and without the Eclipse p2
 director** — a pair of Rust binaries with no JVM anywhere in the path.
 
+## Which installs is this for, and what does it change
+
+The answer differs by runtime, and the difference is worth getting straight
+before any of the numbers below mean anything.
+
+| your install | has a p2 profile? | what this changes |
+|---|---|---|
+| **Integration Server** | **no** | download, install, instance creation, database schemas, fixes — all planned before they run |
+| **Microservices Runtime** | **no** | same |
+| **Trading Networks / EDI / AS2** (they run *inside* an IS instance) | **no** | same |
+| **My webMethods Server** | yes | the above, **plus** profile provisioning in 1.2 s instead of 30.7 s |
+| **Platform Manager, Command Central** | yes | same |
+| **Trading Networks Portal UI** (an MWS application) | yes | same |
+
+Measured on the 12.1 catalogue: a `PIECore` selection closes to 29 products and
+`PIECore` + `MSC` to 33 — **neither pulls in a single product that needs a p2
+profile**. Adding `TNPortal` takes it to 58, eleven of them bringing MWS and OSGI
+along.
+
+So a headless B2B runtime — Trading Networks, the EDI module and AS2 on an
+Integration Server, which is what usually goes to production — never touches p2
+at all. For those installs the gain here is speed and, more to the point,
+*plannability*. p2 is the story only once My webMethods Server, Platform Manager
+or the TN web console is in the picture.
+
+## Measured
+
 Everything below was measured on a real installation against IBM's real
 download and fix services, not estimated.
 
 | | shipped tooling | here |
 |---|---|---|
 | B2B install, download included | — | **191 s** (0.90 GB, 138 artifacts) |
-| provision a Platform Manager profile | 30.7 s (p2 director) | **1.2 s** |
-| peak memory to do it | 401 MB | 56 MB |
 | Trading Networks schema, empty database → 85 tables | — | **0.23 s** |
 | download 6 applicable fixes | — | 79 s, sha256-verified |
+| provision a Platform Manager profile *(MWS-class installs only)* | 30.7 s (p2 director) | **1.2 s** |
+| peak memory to do it | 401 MB | 56 MB |
 
 The p2 comparison is head-to-head: the same twelve feature roots, the same 35
 repositories, the vendor's own director on one side and this on the other. The
@@ -29,28 +56,14 @@ automation, and none of it tells you what it is about to do before it does it.
 These servers expose the same operations as MCP tools an agent can call, and
 every destructive one **defaults to a dry run that reports the plan first**.
 
-## The p2 problem — and when you actually have it
+## The p2 problem
 
-**First, when you do not.** An Integration Server or Microservices Runtime
-install has no p2 profile at all. Measured on the 12.1 catalogue: a `PIECore`
-selection closes to 29 products, `PIECore` + `MSC` to 33, and **neither pulls in
-a single product that needs one**. The only substantive panel either declares is
-`ISMultiInstancePanel` — the IS instance, which is Ant-driven, not p2, and which
-`instance_create` already replaces. The rest are licence acceptance, language
-pack and the administrator password.
-
-That matters for B2B specifically: Trading Networks, the EDI module and AS2 all
-run *inside* an Integration Server instance. A headless B2B runtime — the thing
-you actually put in production — is p2-free. For those installs the win here is
-simply the download-and-install path, and the fact that it can be planned before
-it is run.
-
-**p2 arrives with My webMethods Server, Platform Manager and the Command Central
-runtimes** — and so with the Trading Networks Portal UI, which is an MWS
-application. Add `TNPortal` to that same selection and the closure jumps to 58
-products, 11 of them bringing MWS and OSGI with them. If you are building the TN
-web console, a Command Central-managed estate, or anything MWS-based, this
-section is about you.
+**This section applies to MWS-class installs only** — My webMethods Server,
+Platform Manager, Command Central, the TN Portal UI. If you are installing
+Integration Server, Microservices Runtime, or a headless Trading Networks / EDI
+/ AS2 stack, you have no p2 profile and can skip it. The only substantive panel
+those declare is `ISMultiInstancePanel`, the Integration Server instance, which
+is Ant-driven rather than p2 and which `instance_create` already replaces.
 
 Platform Manager, My webMethods Server and the Command Central runtimes each
 boot from an **Eclipse p2 profile** — an OSGi framework plus a `bundles.info`
