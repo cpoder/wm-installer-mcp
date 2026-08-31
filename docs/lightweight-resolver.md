@@ -1,6 +1,25 @@
 # The lightweight resolver
 
-## What p2 is, and why it is the bottleneck
+## When p2 is your problem, and when it is not
+
+Not every webMethods installation has a p2 profile. Measured on the 12.1
+catalogue, an Integration Server selection (`PIECore`) closes to 29 products and
+an IS + Microservices Runtime selection (`PIECore` + `MSC`) to 33 — **neither
+pulls in a single product that needs one**. The only substantive install panel
+either declares is `ISMultiInstancePanel`, the Integration Server instance, which
+is Ant-driven rather than p2 and is reimplemented in `instance.rs`.
+
+This is worth stating plainly because Trading Networks, the EDI module and AS2
+all run *inside* an Integration Server instance. A headless B2B runtime never
+touches p2.
+
+p2 arrives with **My webMethods Server, Platform Manager and the Command Central
+runtimes** — and therefore with the Trading Networks Portal UI, which is an MWS
+application. Adding `TNPortal` to that same selection takes the closure from 29
+products to 58, eleven of them bringing MWS and OSGI along. Everything below is
+about that case.
+
+## What p2 is, and why it is the bottleneck there
 
 Platform Manager, My webMethods Server and the Command Central runtimes are not
 plain Java processes. Each is an OSGi framework booting from an **Eclipse p2
