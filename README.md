@@ -168,6 +168,18 @@ Measured, from an empty PostgreSQL: ComponentTracker, TradingNetworks and
 TradingNetworksArchive — 47 scripts, 408 statements, **0.23 s**, 85 tables.
 Re-running is a no-op.
 
+**One path, not the whole tool.** `com.webmethods.dcc.cli.Main` accepts a good
+deal more than is covered here — its own option strings list `--action`,
+`--fromVersion`, `--export` / `--import`, `--adminUser` / `--adminPassword`, and
+`--tablespaceDir` / `--tablespaceForData` / `--tablespaceForIndex` /
+`--tablespaceForBlob` / `--bufferpool`. What `database_configure` implements is
+*create at the base version, migrate to the newest, record it*. No drop, no
+export or import, no database user or schema creation, no explicit
+`--fromVersion`. Migrating a schema that is already installed at a different
+level refuses explicitly rather than guessing. The tablespace and bufferpool
+options are Oracle and DB2 placement concerns, and so moot while execution is
+PostgreSQL-only.
+
 ## The interesting parts
 
 Four write-ups in [`docs/`](docs/), each the residue of something that failed
