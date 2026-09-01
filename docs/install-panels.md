@@ -144,6 +144,33 @@ cannot be found under the names that reference them. `install::unpack` now reads
 the manifest and creates them, refusing an absolute target or one containing
 `..`.
 
+## Superseded: instance creation now drives the shipped script
+
+The section above reimplemented what `is_instance.xml` performs through Ant.
+That was the wrong call for the same reason it was wrong for the database
+configurator: `IntegrationServer/instances/is_instance.sh`, the Ant in
+`common/lib/ant` and the XML itself all ship with the product, and an instance
+the product's own tooling created is one it recognises afterwards. Driving it
+takes 6.8 s.
+
+Two things only surfaced by driving it:
+
+**The instance manager needs the installer's jars.** `is_instance.xml` forks
+`com.webmethods.is.instance.InstanceManager` with `install/jars/DistMan.jar`,
+`CustomInstall-ALL-Any.jar`, `wMInstTools` and the rest on its classpath. A
+native install used to skip those as "resources for the shipped installer's
+wizard"; it now installs them. `DistMan.jar` is the exception — it ships with
+the installer *binary* rather than in the product catalogue, so an installation
+assembled purely from catalogue products still cannot run this path.
+
+**The native path skipped that fork entirely**, which is why it appeared to work
+without any of it. Whatever `InstanceManager` does — profile registration, most
+likely — the reimplementation never did.
+
+The native builder is still reachable as `instance_create` with `native: true`,
+for installations that have no `DistMan.jar`. It is documented as producing an
+instance IBM's tooling did not create.
+
 ## What is still not native
 
 **Eclipse p2 profiles — now native.** Superseded: the lightweight resolver in

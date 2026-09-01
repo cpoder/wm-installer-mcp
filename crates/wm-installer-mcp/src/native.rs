@@ -7,7 +7,7 @@ use mcp_rt::{Tool, ToolError, ToolResult};
 use serde_json::{json, Value};
 use wm_core::sdc::{self, Session};
 use wm_core::tree::ProductTree;
-use wm_core::{deps, install, instance, profile, runner};
+use wm_core::{deps, install, profile, runner};
 
 /// Where fetched product trees and artifacts are kept between calls.
 fn state_dir() -> PathBuf {
@@ -368,66 +368,130 @@ pub fn native_install() -> Tool {
 pub fn instance_create() -> Tool {
     Tool::new(
         "instance_create",
-        "Create an Integration Server instance natively — the step the shipped installer's          Java panel performs. Unpacks the instance template with the platform filters the          product's own Ant file applies, copies the core packages, writes config/server.cnf,          bin/setenv_instance.sh and the wrapper configuration, and seeds the administrator          password in the format the server checks against          (PBKDF2-HMAC-SHA256, 600 000 iterations, salted). No JVM involved.",
+        "Create an Integration Server instance by running the product's own \
+         IntegrationServer/instances/is_instance.sh, which drives is_instance.xml through the \
+         Ant that ships in common/lib/ant. The instance is created by the product's tooling, so \
+         the product recognises it afterwards. What this adds is a dry run that prints the exact \
+         command, with passwords masked. Defaults to a dry run.",
         json!({
             "type": "object",
             "required": ["wm_home"],
             "properties": {
                 "wm_home": { "type": "string", "description": "Installation root." },
                 "name": { "type": "string", "description": "Instance name (default \"default\")." },
-                "primary_port": { "type": "integer", "description": "HTTP port, default 5555." },
-                "secure_port": { "type": "integer", "description": "HTTPS port, default 5543." },
-                "diagnostic_port": { "type": "integer", "description": "Default 9999." },
-                "jmx_port": { "type": "integer", "description": "JMX port the service wrapper exposes, default 8075." },
-                "bind_address": { "type": "string", "description": "Interface to bind; every interface when omitted." },
-                "admin_password": { "type": "string", "description": "Administrator password. Without it the instance has no usable credential." },
-                "change_password_on_login": { "type": "boolean" },
-                "packages": { "type": "array", "items": { "type": "string" }, "description": "Packages to copy in beyond the core set." }
+                "primary_port": { "type": "integer", "description": "HTTP port; the script defaults to 5555." },
+                "secure_port": { "type": "integer", "description": "HTTPS port; the script defaults to 5543." },
+                "diagnostic_port": { "type": "integer", "description": "The script defaults to 9999." },
+                "jmx_port": { "type": "integer", "description": "The script defaults to 8075." },
+                "bind_address": { "type": "string", "description": "Default bind address for the ports." },
+                "admin_password": { "type": "string", "description": "Administrator password; the script reuses the install-time one when omitted." },
+                "license_file": { "type": "string", "description": "Path to an Integration Server licence key file." },
+                "packages": { "type": "array", "items": { "type": "string" }, "description": "Non-core packages to include." },
+                "db_type": { "type": "string", "description": "ORACLE, DB2, SQLSERVER, MYSQLCE, MYSQLEE or POSTGRESQL. Omitted, the instance uses the embedded database." },
+                "db_alias": { "type": "string" },
+                "db_url": { "type": "string" },
+                "db_username": { "type": "string" },
+                "db_password": { "type": "string" },
+                "native": { "type": "boolean", "description": "Build the instance directly instead of running is_instance.sh. Use only when the installation has no install/jars/DistMan.jar — that jar ships with the installer binary, not with the products, and the shipped script's instance manager needs it. An instance built this way is not one IBM's tooling created." },
+                "apply": { "type": "boolean", "description": "Set true to run; otherwise a dry run." }
             }
         }),
         Box::new(|args| {
             let wm_home = PathBuf::from(req_str(args, "wm_home")?);
-            let spec = instance::InstanceSpec {
-                name: opt_str(args, "name").unwrap_or_else(|| "default".into()),
-                primary_port: port(args, "primary_port", 5555)?,
-                secure_port: port(args, "secure_port", 5543)?,
-                diagnostic_port: port(args, "diagnostic_port", 9999)?,
-                jmx_port: port(args, "jmx_port", 8075)?,
-                bind_address: opt_str(args, "bind_address").unwrap_or_default(),
-                lock_mode: "full".into(),
+            let name = opt_str(args, "name").unwrap_or_else(|| "default".into());
+            let options = wm_core::instance::ant::Options {
+                primary_port: opt_port(args, "primary_port")?,
+                secure_port: opt_port(args, "secure_port")?,
+                diagnostic_port: opt_port(args, "diagnostic_port")?,
+                jmx_port: opt_port(args, "jmx_port")?,
                 admin_password: opt_str(args, "admin_password"),
-                change_password_on_login: flag(args, "change_password_on_login", false),
-                extra_packages: str_list(args, "packages"),
+                bind_address: opt_str(args, "bind_address"),
+                license_file: opt_str(args, "license_file"),
+                packages: str_list(args, "packages"),
+                db_type: opt_str(args, "db_type"),
+                db_alias: opt_str(args, "db_alias"),
+                db_url: opt_str(args, "db_url"),
+                db_username: opt_str(args, "db_username"),
+                db_password: opt_str(args, "db_password"),
             };
-            let created = instance::create(&wm_home, &spec).map_err(ToolError::failed)?;
-            let mut summary = format!(
-                "instance {} created at {}: {} template files, {} package(s), {} config file(s)",
-                spec.name,
-                created.path.display(),
-                created.template_files,
-                created.packages.len(),
-                created.wrote.len()
-            );
-            if !created.skipped.is_empty() {
-                summary.push_str(&format!("; {} caveat(s)", created.skipped.len()));
+            if flag(args, "native", false) {
+                if !flag(args, "apply", false) {
+                    return Ok(ToolResult::structured(
+                        format!(
+                            "dry run: would build instance {name} directly, without is_instance.sh"
+                        ),
+                        json!({ "native": true }),
+                    ));
+                }
+                let spec = wm_core::instance::InstanceSpec {
+                    name: name.clone(),
+                    primary_port: options.primary_port.unwrap_or(5555),
+                    secure_port: options.secure_port.unwrap_or(5543),
+                    diagnostic_port: options.diagnostic_port.unwrap_or(9999),
+                    jmx_port: options.jmx_port.unwrap_or(8075),
+                    bind_address: options.bind_address.clone().unwrap_or_default(),
+                    lock_mode: "full".into(),
+                    admin_password: options.admin_password.clone(),
+                    change_password_on_login: false,
+                    extra_packages: options.packages.clone(),
+                };
+                let created =
+                    wm_core::instance::create(&wm_home, &spec).map_err(ToolError::failed)?;
+                return Ok(ToolResult::structured(
+                    format!(
+                        "instance {name} built directly at {}: {} template file(s), {} package(s). \
+                         Not created by the product's own tooling.",
+                        created.path.display(),
+                        created.template_files,
+                        created.packages.len()
+                    ),
+                    json!({ "path": created.path, "native": true, "skipped": created.skipped }),
+                ));
             }
+
+            let invocation = wm_core::instance::ant::create(&wm_home, &name, &options)
+                .map_err(ToolError::failed)?;
+            if !flag(args, "apply", false) {
+                return Ok(ToolResult::structured(
+                    format!("dry run: would create instance {name}"),
+                    json!({ "command": invocation.display() }),
+                ));
+            }
+            let started = std::time::Instant::now();
+            let (ok, transcript) =
+                wm_core::instance::ant::run(&invocation).map_err(ToolError::failed)?;
+            if !ok {
+                return Err(ToolError::failed(format!(
+                    "is_instance.sh failed:\n{}",
+                    tail(&transcript, 25)
+                )));
+            }
+            let path = wm_home
+                .join("IntegrationServer")
+                .join("instances")
+                .join(&name);
             Ok(ToolResult::structured(
-                summary,
-                json!({
-                    "path": created.path,
-                    "template_files": created.template_files,
-                    "packages": created.packages,
-                    "wrote": created.wrote,
-                    "skipped": created.skipped,
-                    "ports": {
-                        "primary": spec.primary_port,
-                        "secure": spec.secure_port,
-                        "diagnostic": spec.diagnostic_port,
-                    },
-                }),
+                format!(
+                    "instance {name} created at {} in {:.1}s",
+                    path.display(),
+                    started.elapsed().as_secs_f64()
+                ),
+                json!({ "name": name, "path": path }),
             ))
         }),
     )
+}
+
+/// An optional port argument.
+fn opt_port(args: &Value, key: &str) -> Result<Option<u16>, ToolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|p| *p > 0 && *p <= u64::from(u16::MAX))
+            .map(|p| Some(p as u16))
+            .ok_or_else(|| ToolError::invalid(format!("{key} must be a port number"))),
+    }
 }
 
 /// Capture a p2 profile for replay elsewhere.
@@ -508,17 +572,6 @@ pub fn profile_replay() -> Tool {
             Ok(ToolResult::structured(summary, json!({ "result": done })))
         }),
     )
-}
-
-/// Read a port argument, refusing a value that cannot be one.
-fn port(args: &Value, key: &str, default: u16) -> Result<u16, ToolError> {
-    match args.get(key).and_then(Value::as_u64) {
-        None => Ok(default),
-        Some(n) if n >= 1 && n <= u16::MAX as u64 => Ok(n as u16),
-        Some(n) => Err(ToolError::invalid(format!(
-            "{key} must be 1..65535, got {n}"
-        ))),
-    }
 }
 
 /// Perform the install described by `spec_path`. Entry point for the job process.
@@ -605,10 +658,41 @@ pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
             unpacked.files.len()
         );
     }
+    // Resource jars used to be skipped as "the shipped installer's wizard
+    // resources". They are not: `IntegrationServer/instances/is_instance.xml`
+    // puts DistMan, CustomInstall, wMInstTools and the rest of `install/jars`
+    // on the classpath of the instance manager it forks. Driving the product's
+    // own tooling means installing the tooling.
+    let jars = tree.select(
+        products.iter().map(String::as_str),
+        wm_core::tree::ArtifactKind::ResourceJar,
+    );
+    let jar_dir = install_dir.join("install").join("jars");
+    std::fs::create_dir_all(&jar_dir).map_err(|e| e.to_string())?;
+    let mut jars_done = 0usize;
+    for jar in &jars {
+        let fetched = install::fetch(&mut session, &cgi, &repository, jar, &cache)
+            .map_err(|e| e.to_string())?;
+        let name = if jar.name.ends_with(".jar") {
+            jar.name.clone()
+        } else {
+            format!("{}.jar", jar.name)
+        };
+        std::fs::copy(&fetched.path, jar_dir.join(&name)).map_err(|e| e.to_string())?;
+        jars_done += 1;
+        bytes += fetched.size;
+    }
+    if jars_done > 0 {
+        println!("installed {jars_done} tooling jar(s) into install/jars");
+    }
+
     for product in &products {
         install::write_prop(&install_dir, product, &tree).map_err(|e| e.to_string())?;
     }
-    println!("installed {done} artifact(s), {:.2} GB", bytes as f64 / 1e9);
+    println!(
+        "installed {done} artifact(s) and {jars_done} jar(s), {:.2} GB",
+        bytes as f64 / 1e9
+    );
 
     let panels: Vec<&String> = products
         .iter()

@@ -32,6 +32,7 @@ finished result between machines.
 | create a p2 profile | **the shipped p2 director** | finds the bootable runtime, builds the command, reports it first |
 | copy a profile elsewhere | **native** — it is a file copy, not a solve | 3 MB archive instead of a 218 MB directory, 0.1 s |
 | create database schemas | **the shipped `dbConfigurator.sh`** | prerequisite closure, topological order, the exact commands first |
+| create an IS instance | **the shipped `is_instance.sh`** (Ant) | a dry run with the command, passwords masked |
 | find and fetch fixes | **native** — IBM's fix service, over HTTP | inventory, applicability, verified download |
 | apply a fix | **native** — the recipe is declarative | dry run, profile `bundles.info` rewrite, backups |
 
@@ -43,6 +44,7 @@ Against IBM's real services and a real installation, not estimated.
 |---|---|
 | B2B install, download included | **191 s** (0.90 GB, 138 artifacts) |
 | provision an SPM profile via the shipped director | **21 s**, 498 bundles |
+| create an IS instance via the shipped `is_instance.sh` | **6.8 s** |
 | copy that profile to another machine | **0.1 s** |
 | Trading Networks schema via the shipped configurator | **5 s**, 3 components in dependency order |
 | find and download 6 applicable fixes | **79 s**, sha256-verified |
@@ -80,7 +82,8 @@ never touches p2 at all.
   another machine as a ~3 MB archive, p2 registry included.
 - `database_plan`, `database_configure` — **run the product's own
   `dbConfigurator.sh`**, with prerequisites resolved and ordered first.
-- `instance_create` — create an Integration Server instance.
+- `instance_create` — create an Integration Server instance by running the
+  shipped `is_instance.sh`.
 - `script_generate`, `script_validate`, `install_run`, `image_build` — drive the
   shipped installer, when you want it.
 - `inventory_read`, `plan_resolve`, `diagnose_log`, `job_status`.
@@ -124,10 +127,13 @@ framework idle with no HTTP connector and no error naming the cause.
 
 ## Limits
 
-- **`instance_create` reimplements `is_instance.xml`** rather than driving it
-  through the Ant that ships alongside. It is verified — the instance starts and
-  authenticates — but it is inconsistent with the principle above, and it should
-  be changed.
+- **`install/jars/DistMan.jar` is not in the product catalogue.** It ships with
+  the installer binary, and `is_instance.xml` puts it on the classpath of the
+  instance manager it forks. So an installation built only from catalogue
+  products cannot create an instance the supported way until the installer's
+  jars are present. `instance_create` says so by name when they are missing, and
+  `native: true` builds the instance directly as a fallback — an instance that
+  works, but that IBM's tooling did not create.
 - **Fix application is native**, because a fix recipe is a declarative list of
   extract and delete actions rather than a program. Actions needing a p2
   director are reported as *not performed*, never silently skipped. It does

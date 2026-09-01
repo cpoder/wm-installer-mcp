@@ -867,3 +867,146 @@ mod tests {
         );
     }
 }
+
+/// Create an instance with the product's own Ant script.
+///
+/// `IntegrationServer/instances/is_instance.sh` ships with the product, along
+/// with the Ant that runs it (`common/lib/ant`) and the `is_instance.xml` that
+/// holds the logic. It self-documents with its `help` target and takes exactly
+/// the inputs this module used to reimplement.
+///
+/// Driving it is the supported way, for the same reason the p2 director and
+/// `dbConfigurator.sh` are driven rather than reimplemented: an instance the
+/// product's own tooling created is one it will recognise afterwards.
+pub mod ant {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use serde::Serialize;
+
+    use crate::error::{Error, Result};
+
+    /// An `is_instance.sh` invocation, before it is run.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct Invocation {
+        pub program: PathBuf,
+        pub args: Vec<String>,
+        /// `JAVA_HOME`, which the script wants from `IntegrationServer/bin/setenv.sh`
+        /// and refuses to run without. The product ships its own JVM, so there
+        /// is no reason to depend on the caller's environment or on a setenv
+        /// the installation may not have.
+        pub java_home: PathBuf,
+    }
+
+    impl Invocation {
+        /// Render the command, masking anything that looks like a secret.
+        pub fn display(&self) -> String {
+            let masked: Vec<String> = self
+                .args
+                .iter()
+                .map(|arg| match arg.split_once('=') {
+                    Some((key, _))
+                        if key.ends_with("password") || key.ends_with("admin.password") =>
+                    {
+                        format!("{key}=******")
+                    }
+                    _ => arg.clone(),
+                })
+                .collect();
+            format!("{} {}", self.program.display(), masked.join(" "))
+        }
+    }
+
+    /// Optional settings the `create` target accepts.
+    #[derive(Debug, Clone, Default)]
+    pub struct Options {
+        pub primary_port: Option<u16>,
+        pub secure_port: Option<u16>,
+        pub diagnostic_port: Option<u16>,
+        pub jmx_port: Option<u16>,
+        pub admin_password: Option<String>,
+        pub bind_address: Option<String>,
+        pub license_file: Option<String>,
+        pub packages: Vec<String>,
+        /// `ORACLE`, `DB2`, `SQLSERVER`, `MYSQLCE`, `MYSQLEE`, `POSTGRESQL`.
+        /// Omitted entirely, the instance uses the embedded database.
+        pub db_type: Option<String>,
+        pub db_alias: Option<String>,
+        pub db_url: Option<String>,
+        pub db_username: Option<String>,
+        pub db_password: Option<String>,
+    }
+
+    /// Build the invocation that creates `name`.
+    pub fn create(wm_home: &Path, name: &str, options: &Options) -> Result<Invocation> {
+        let program = wm_home
+            .join("IntegrationServer")
+            .join("instances")
+            .join("is_instance.sh");
+        if !program.is_file() {
+            return Err(Error::Malformed(format!(
+                "{} is missing; Integration Server is not installed here",
+                program.display()
+            )));
+        }
+        let mut args = vec!["create".to_string(), format!("-Dinstance.name={name}")];
+        let mut push = |key: &str, value: Option<String>| {
+            if let Some(value) = value {
+                args.push(format!("-D{key}={value}"));
+            }
+        };
+        push("primary.port", options.primary_port.map(|p| p.to_string()));
+        push("secure.port", options.secure_port.map(|p| p.to_string()));
+        push(
+            "diagnostic.port",
+            options.diagnostic_port.map(|p| p.to_string()),
+        );
+        push("jmx.port", options.jmx_port.map(|p| p.to_string()));
+        push("admin.password", options.admin_password.clone());
+        push("instance.ip", options.bind_address.clone());
+        push("license.file", options.license_file.clone());
+        push("db.type", options.db_type.clone());
+        push("db.alias", options.db_alias.clone());
+        push("db.url", options.db_url.clone());
+        push("db.username", options.db_username.clone());
+        push("db.password", options.db_password.clone());
+        if !options.packages.is_empty() {
+            args.push(format!("-Dpackage.list={}", options.packages.join(",")));
+        }
+        let java_home = wm_home.join("jvm").join("jvm");
+        if !java_home.join("bin").join("java").is_file() {
+            return Err(Error::Malformed(format!(
+                "no JVM at {}; is_instance.sh cannot run",
+                java_home.display()
+            )));
+        }
+        Ok(Invocation {
+            program,
+            args,
+            java_home,
+        })
+    }
+
+    /// Run it, returning whether Ant succeeded and what it printed.
+    pub fn run(invocation: &Invocation) -> Result<(bool, String)> {
+        let output = Command::new(&invocation.program)
+            .args(&invocation.args)
+            .env("JAVA_HOME", &invocation.java_home)
+            .env("JRE_HOME", &invocation.java_home)
+            .current_dir(
+                invocation
+                    .program
+                    .parent()
+                    .unwrap_or_else(|| Path::new(".")),
+            )
+            .output()
+            .map_err(|e| {
+                Error::Exec(format!("cannot run {}: {e}", invocation.program.display()))
+            })?;
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        // Ant reports its own verdict; the exit code alone has been unreliable.
+        let ok = output.status.success() && text.contains("BUILD SUCCESSFUL");
+        Ok((ok, text))
+    }
+}
