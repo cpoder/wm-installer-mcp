@@ -3,25 +3,25 @@
 Two MCP servers that plan, install, provision and patch IBM webMethods 12.1 from
 an agent — a pair of Rust binaries.
 
-## The principle
+## What is replaced, and what is not
 
-An earlier version of this reimplemented the product's provisioning tools. That
-was a mistake, and it is worth stating plainly because it shaped everything
-here.
+The target is **the installer** — the Java setup wizard and Update Manager's
+console. Those are what you cannot automate, cannot ask what they are about to
+do, and cannot drive from an agent.
 
-**The product installs its own tools.** The p2 director, `dbConfigurator.sh`,
-their Java classes, their JDBC drivers and a JVM all ship with webMethods and
-all run from the command line. Reimplementing them buys speed and costs
-supportability: a schema or a profile that IBM's tooling did not create is one
-IBM will not support, and the divergence is not hypothetical — a native database
-path recorded a component level as `12.0` where the shipped configurator writes
-`v12.0`, and a natively-built p2 profile leaves a registry that a later Update
-Manager run misreads.
+The target is **not the product's own tooling**. `dbConfigurator.sh`, the p2
+director and `is_instance.sh` are installed *by* the installer and are part of
+the product: current, supported, and drivable from a command line. An earlier
+version of this reimplemented them, which was a mistake — a schema or a profile
+IBM's tooling did not create is one IBM will not support, and the divergence was
+real, not hypothetical: a native database path recorded a component level as
+`12.0` where the shipped configurator writes `v12.0`, and a natively-built p2
+profile leaves a registry a later Update Manager run misreads.
 
-So the rule here is: **drive the vendor's tools, and add what they lack.** What
-they lack is not execution. It is everything around it — knowing what will
-happen before it happens, pulling in prerequisites, ordering work, and moving a
-finished result between machines.
+So the line is: **replace the installer, and drive what the installer installs.**
+Replacing the installer includes doing everything it does — which is more than
+unpacking archives. It lays down `install/jars/`, including its own jar as
+`DistMan.jar`, because the product's tooling puts those on its classpath.
 
 ## What that means in practice
 
@@ -127,13 +127,13 @@ framework idle with no HTTP connector and no error naming the cause.
 
 ## Limits
 
-- **`install/jars/DistMan.jar` is not in the product catalogue.** It ships with
-  the installer binary, and `is_instance.xml` puts it on the classpath of the
-  instance manager it forks. So an installation built only from catalogue
-  products cannot create an instance the supported way until the installer's
-  jars are present. `instance_create` says so by name when they are missing, and
-  `native: true` builds the instance directly as a fallback — an instance that
-  works, but that IBM's tooling did not create.
+- **`install/jars/DistMan.jar` is the installer's own jar**, not a catalogue
+  product — it is `sagInstaller.jar`, laid down under that name, and
+  `is_instance.xml` puts it on the classpath of the instance manager it forks.
+  Pass `installer_jar` to `native_install` and it is installed like anything
+  else; without it, `instance_create` says so by name and `native: true` builds
+  the instance directly instead — an instance that works, but that IBM's tooling
+  did not create.
 - **Fix application is native**, because a fix recipe is a declarative list of
   extract and delete actions rather than a program. Actions needing a p2
   director are reported as *not performed*, never silently skipped. It does

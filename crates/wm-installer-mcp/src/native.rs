@@ -294,6 +294,7 @@ pub fn native_install() -> Tool {
                 "release": { "type": "string" },
                 "platform": { "type": "string" },
                 "products": { "type": "array", "items": { "type": "string" } },
+                "installer_jar": { "type": "string", "description": "Path to the installer's own jar (sagInstaller.jar, inside the downloaded installer). It is laid down as install/jars/DistMan.jar, which is where the shipped tooling looks for it — is_instance.xml puts it on the instance manager's classpath. Defaults to $WM_INSTALLER_JAR." },
                 "install_dir": { "type": "string" },
                 "include_mandatory": { "type": "boolean" },
                 "host": { "type": "string" }
@@ -332,6 +333,8 @@ pub fn native_install() -> Tool {
                 "install_dir": install_dir,
                 "products": resolution.paths(),
                 "host": host(args),
+                "installer_jar": opt_str(args, "installer_jar")
+                    .or_else(|| std::env::var("WM_INSTALLER_JAR").ok()),
             });
             let jobs = jobs_dir();
             std::fs::create_dir_all(&jobs)
@@ -681,6 +684,29 @@ pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
         std::fs::copy(&fetched.path, jar_dir.join(&name)).map_err(|e| e.to_string())?;
         jars_done += 1;
         bytes += fetched.size;
+    }
+    // `install/jars/DistMan.jar` is the installer's own jar, which the
+    // installer lays down under that name. It is not in the product catalogue,
+    // and the shipped tooling needs it: `is_instance.xml` puts it on the
+    // classpath of the instance manager it forks. Replacing the installer means
+    // doing what it does, and this is part of it.
+    let installer_jar = spec
+        .get("installer_jar")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    if let Some(source) = installer_jar {
+        let target = jar_dir.join("DistMan.jar");
+        std::fs::copy(&source, &target)
+            .map_err(|e| format!("cannot install {} as DistMan.jar: {e}", source.display()))?;
+        jars_done += 1;
+        println!("installed the installer's own jar as install/jars/DistMan.jar");
+    } else if !jar_dir.join("DistMan.jar").is_file() {
+        println!(
+            "note: install/jars/DistMan.jar is absent. It is the installer's own jar \
+             (sagInstaller.jar) rather than a catalogue product, and the shipped \
+             is_instance.sh needs it. Pass installer_jar to lay it down."
+        );
     }
     if jars_done > 0 {
         println!("installed {jars_done} tooling jar(s) into install/jars");

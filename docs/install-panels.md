@@ -159,9 +159,12 @@ Two things only surfaced by driving it:
 `com.webmethods.is.instance.InstanceManager` with `install/jars/DistMan.jar`,
 `CustomInstall-ALL-Any.jar`, `wMInstTools` and the rest on its classpath. A
 native install used to skip those as "resources for the shipped installer's
-wizard"; it now installs them. `DistMan.jar` is the exception — it ships with
-the installer *binary* rather than in the product catalogue, so an installation
-assembled purely from catalogue products still cannot run this path.
+wizard"; it now installs them. `DistMan.jar` is the exception, and it is not a
+limit: it *is* `sagInstaller.jar`, the installer's own jar, which the installer
+lays down under that name. Replacing the installer includes doing that, so
+`native_install` takes an `installer_jar` and installs it. Verified end to end —
+an installation built entirely without the vendor installer, in which the
+vendor's own `is_instance.sh` then creates an instance in 5.2 s.
 
 **The native path skipped that fork entirely**, which is why it appeared to work
 without any of it. Whatever `InstanceManager` does — profile registration, most
