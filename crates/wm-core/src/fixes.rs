@@ -152,18 +152,28 @@ pub fn available(
 
 /// Extract `content.xml` from a p2 metadata archive and parse it.
 pub fn parse_content_jar(bytes: &[u8]) -> Result<Vec<Fix>> {
+    // The caller holds bytes, not a path, so the size is the only handle a
+    // failure here can be traced by. Say it rather than nothing.
+    let size = bytes.len();
     let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|e| Error::Malformed(format!("fix metadata is not an archive: {e}")))?;
+    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| {
+        Error::Malformed(format!(
+            "fix metadata ({size} bytes) is not an archive: {e}"
+        ))
+    })?;
     let mut xml = String::new();
     {
-        let mut entry = archive
-            .by_name("content.xml")
-            .map_err(|e| Error::Malformed(format!("no content.xml in the fix metadata: {e}")))?;
+        let mut entry = archive.by_name("content.xml").map_err(|e| {
+            Error::Malformed(format!(
+                "no content.xml in the fix metadata ({size} bytes): {e}"
+            ))
+        })?;
         use std::io::Read as _;
-        entry
-            .read_to_string(&mut xml)
-            .map_err(|e| Error::Malformed(format!("content.xml unreadable: {e}")))?;
+        entry.read_to_string(&mut xml).map_err(|e| {
+            Error::Malformed(format!(
+                "content.xml of the fix metadata ({size} bytes) unreadable: {e}"
+            ))
+        })?;
     }
     Ok(parse_content_xml(&xml))
 }
@@ -278,17 +288,27 @@ impl FixArtifact {
 /// Parse the p2 artifact index (`artifacts.jar`).
 pub fn parse_artifact_index(bytes: &[u8]) -> Result<Vec<FixArtifact>> {
     let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|e| Error::Malformed(format!("artifact index is not an archive: {e}")))?;
+    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| {
+        Error::Malformed(format!(
+            "artifact index ({} bytes) is not an archive: {e}",
+            bytes.len()
+        ))
+    })?;
     let mut xml = String::new();
     {
-        let mut entry = archive
-            .by_name("artifacts.xml")
-            .map_err(|e| Error::Malformed(format!("no artifacts.xml in the index: {e}")))?;
+        let mut entry = archive.by_name("artifacts.xml").map_err(|e| {
+            Error::Malformed(format!(
+                "no artifacts.xml in the index ({} bytes): {e}",
+                bytes.len()
+            ))
+        })?;
         use std::io::Read as _;
-        entry
-            .read_to_string(&mut xml)
-            .map_err(|e| Error::Malformed(format!("artifacts.xml unreadable: {e}")))?;
+        entry.read_to_string(&mut xml).map_err(|e| {
+            Error::Malformed(format!(
+                "artifacts.xml of the index ({} bytes) unreadable: {e}",
+                bytes.len()
+            ))
+        })?;
     }
     Ok(parse_artifact_xml(&xml))
 }

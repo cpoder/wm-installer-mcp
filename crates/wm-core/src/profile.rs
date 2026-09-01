@@ -219,12 +219,24 @@ pub fn capture(wm_home: &Path, name: &str, output: &Path) -> Result<Manifest> {
         tokenised,
         executable,
     };
-    let json = serde_json::to_string_pretty(&manifest)
-        .map_err(|e| Error::Exec(format!("cannot serialise the manifest: {e}")))?;
-    zip.start_file("manifest.json", options)
-        .map_err(|e| Error::Exec(format!("cannot add the manifest: {e}")))?;
-    zip.write_all(json.as_bytes())
-        .map_err(|e| Error::Exec(format!("cannot write the manifest: {e}")))?;
+    let json = serde_json::to_string_pretty(&manifest).map_err(|e| {
+        Error::Exec(format!(
+            "cannot serialise the manifest for {}: {e}",
+            output.display()
+        ))
+    })?;
+    zip.start_file("manifest.json", options).map_err(|e| {
+        Error::Exec(format!(
+            "cannot add the manifest to {}: {e}",
+            output.display()
+        ))
+    })?;
+    zip.write_all(json.as_bytes()).map_err(|e| {
+        Error::Exec(format!(
+            "cannot write the manifest to {}: {e}",
+            output.display()
+        ))
+    })?;
     zip.finish()
         .map_err(|e| Error::Exec(format!("cannot finish {}: {e}", output.display())))?;
     Ok(manifest)
@@ -266,12 +278,13 @@ pub fn replay(
     let manifest: Manifest = {
         let mut entry = zip
             .by_name("manifest.json")
-            .map_err(|e| Error::Exec(format!("no manifest in the capture: {e}")))?;
+            .map_err(|e| Error::Exec(format!("no manifest in {}: {e}", capture.display())))?;
         let mut text = String::new();
-        entry
-            .read_to_string(&mut text)
-            .map_err(|e| Error::Exec(format!("manifest unreadable: {e}")))?;
-        serde_json::from_str(&text).map_err(|e| Error::Malformed(format!("manifest: {e}")))?
+        entry.read_to_string(&mut text).map_err(|e| {
+            Error::Exec(format!("manifest of {} unreadable: {e}", capture.display()))
+        })?;
+        serde_json::from_str(&text)
+            .map_err(|e| Error::Malformed(format!("manifest of {}: {e}", capture.display())))?
     };
 
     let name = name.unwrap_or(&manifest.name).to_string();
@@ -328,9 +341,12 @@ pub fn replay(
     let mut written = 0usize;
     if !dry_run {
         for index in 0..zip.len() {
-            let mut entry = zip
-                .by_index(index)
-                .map_err(|e| Error::Exec(format!("cannot read entry {index}: {e}")))?;
+            let mut entry = zip.by_index(index).map_err(|e| {
+                Error::Exec(format!(
+                    "cannot read entry {index} of {}: {e}",
+                    capture.display()
+                ))
+            })?;
             let entry_name = entry.name().to_string();
             let Some(relative) = entry_name.strip_prefix("files/") else {
                 continue;
@@ -341,9 +357,12 @@ pub fn replay(
                 )));
             };
             let mut bytes = Vec::new();
-            entry
-                .read_to_end(&mut bytes)
-                .map_err(|e| Error::Exec(format!("cannot read {relative}: {e}")))?;
+            entry.read_to_end(&mut bytes).map_err(|e| {
+                Error::Exec(format!(
+                    "cannot read {relative} from {}: {e}",
+                    capture.display()
+                ))
+            })?;
             if manifest.tokenised.iter().any(|t| t == relative) {
                 if let Ok(text) = String::from_utf8(bytes.clone()) {
                     bytes = text
@@ -816,7 +835,12 @@ pub mod director {
             .arg(&invocation.launcher)
             .args(&invocation.args)
             .output()
-            .map_err(|e| Error::Exec(format!("cannot run the p2 director: {e}")))?;
+            .map_err(|e| {
+                Error::Exec(format!(
+                    "cannot run the p2 director ({}): {e}",
+                    invocation.display()
+                ))
+            })?;
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
         Ok((output.status.success(), text))

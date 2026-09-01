@@ -544,15 +544,16 @@ pub fn run_console(
     use std::os::unix::process::CommandExt as _;
 
     let (master, slave) = open_pty()?;
-    let child_in = slave
-        .try_clone()
-        .map_err(|e| Error::Exec(format!("pty dup: {e}")))?;
-    let child_out = slave
-        .try_clone()
-        .map_err(|e| Error::Exec(format!("pty dup: {e}")))?;
-    let child_err = slave
-        .try_clone()
-        .map_err(|e| Error::Exec(format!("pty dup: {e}")))?;
+    // Three identical messages here were indistinguishable in a log; name the
+    // descriptor each clone was for.
+    let clone = |which: &str| {
+        slave
+            .try_clone()
+            .map_err(|e| Error::Exec(format!("cannot duplicate the pty for {which}: {e}")))
+    };
+    let child_in = clone("stdin")?;
+    let child_out = clone("stdout")?;
+    let child_err = clone("stderr")?;
 
     let mut command = Command::new(program);
     command

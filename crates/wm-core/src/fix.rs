@@ -124,9 +124,12 @@ impl Fix {
 
         let mut entries = Vec::new();
         for index in 0..zip.len() {
-            let entry = zip
-                .by_index(index)
-                .map_err(|e| Error::Exec(format!("cannot read entry {index}: {e}")))?;
+            let entry = zip.by_index(index).map_err(|e| {
+                Error::Exec(format!(
+                    "cannot read entry {index} of {}: {e}",
+                    path.display()
+                ))
+            })?;
             let name = entry.name().to_string();
             if !name.starts_with("META-INF") && !name.ends_with('/') {
                 entries.push(name);
@@ -418,9 +421,12 @@ fn extract(fix: &Fix, wm_home: &Path, include: &str, dry_run: bool) -> Result<Ve
     let mut written = Vec::new();
 
     for index in 0..zip.len() {
-        let mut entry = zip
-            .by_index(index)
-            .map_err(|e| Error::Exec(format!("cannot read entry {index}: {e}")))?;
+        let mut entry = zip.by_index(index).map_err(|e| {
+            Error::Exec(format!(
+                "cannot read entry {index} of {}: {e}",
+                fix.path.display()
+            ))
+        })?;
         let name = entry.name().to_string();
         if name.starts_with("META-INF") || name.ends_with('/') || !glob_matches(include, &name) {
             continue;
@@ -436,9 +442,12 @@ fn extract(fix: &Fix, wm_home: &Path, include: &str, dry_run: bool) -> Result<Ve
                 fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
             }
             let mut bytes = Vec::new();
-            entry
-                .read_to_end(&mut bytes)
-                .map_err(|e| Error::Exec(format!("cannot read {name}: {e}")))?;
+            entry.read_to_end(&mut bytes).map_err(|e| {
+                Error::Exec(format!(
+                    "cannot read {name} from {}: {e}",
+                    fix.path.display()
+                ))
+            })?;
             fs::write(&target, &bytes).map_err(|e| Error::io(&target, e))?;
         }
         written.push(relative.to_string_lossy().into_owned());

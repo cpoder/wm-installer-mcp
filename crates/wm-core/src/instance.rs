@@ -228,9 +228,12 @@ fn extract_template(template: &Path, dir: &Path) -> Result<usize> {
     let mut written = 0usize;
 
     for index in 0..zip.len() {
-        let mut entry = zip
-            .by_index(index)
-            .map_err(|e| Error::Exec(format!("cannot read template entry {index}: {e}")))?;
+        let mut entry = zip.by_index(index).map_err(|e| {
+            Error::Exec(format!(
+                "cannot read entry {index} of {}: {e}",
+                template.display()
+            ))
+        })?;
         let name = entry.name().to_string();
         if skip_on_this_platform(&name) {
             continue;
@@ -249,9 +252,12 @@ fn extract_template(template: &Path, dir: &Path) -> Result<usize> {
             fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
         }
         let mut bytes = Vec::new();
-        entry
-            .read_to_end(&mut bytes)
-            .map_err(|e| Error::Exec(format!("cannot read {name} from the template: {e}")))?;
+        entry.read_to_end(&mut bytes).map_err(|e| {
+            Error::Exec(format!(
+                "cannot read {name} from {}: {e}",
+                template.display()
+            ))
+        })?;
         fs::write(&target, &bytes).map_err(|e| Error::io(&target, e))?;
         // The Ant file chmods bin/*.sh; do the same for every script placed.
         if name.ends_with(".sh") {

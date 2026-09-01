@@ -122,11 +122,16 @@ impl Session {
             .post(format!("https://{host}/services/auth"))
             .header("Content-Type", "application/json")
             .send_json(&body)
-            .map_err(|e| Error::Exec(format!("authentication request failed: {e}")))?;
-        let payload: serde_json::Value = response
-            .into_body()
-            .read_json()
-            .map_err(|e| Error::Exec(format!("authentication response unreadable: {e}")))?;
+            .map_err(|e| {
+                Error::Exec(format!(
+                    "authentication request to https://{host}/services/auth failed: {e}"
+                ))
+            })?;
+        let payload: serde_json::Value = response.into_body().read_json().map_err(|e| {
+            Error::Exec(format!(
+                "authentication response from https://{host}/services/auth unreadable: {e}"
+            ))
+        })?;
         let access_token = payload
             .get("access_token")
             .and_then(serde_json::Value::as_str)
@@ -159,10 +164,12 @@ impl Session {
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.access_token))
             .call()
-            .map_err(|e| Error::Exec(format!("cannot list entitlements: {e}")))?
+            .map_err(|e| Error::Exec(format!("cannot list entitlements ({url}): {e}")))?
             .into_body()
             .read_json()
-            .map_err(|e| Error::Exec(format!("entitlements response unreadable: {e}")))?;
+            .map_err(|e| {
+                Error::Exec(format!("entitlements response from {url} unreadable: {e}"))
+            })?;
         let data = payload
             .get("data")
             .and_then(serde_json::Value::as_array)
@@ -205,12 +212,12 @@ impl Session {
             .header("Authorization", format!("Bearer {}", self.access_token))
             .header("Accept", "application/octet-stream")
             .call()
-            .map_err(|e| Error::Exec(format!("cannot fetch the product tree: {e}")))?
+            .map_err(|e| Error::Exec(format!("cannot fetch the product tree ({url}): {e}")))?
             .into_body()
             .into_reader();
         let mut text = String::new();
         body.read_to_string(&mut text)
-            .map_err(|e| Error::Exec(format!("product tree unreadable: {e}")))?;
+            .map_err(|e| Error::Exec(format!("product tree from {url} unreadable: {e}")))?;
         if text.starts_with('{') {
             return Err(Error::Exec(format!(
                 "the download centre refused sandbox {sandbox:?}: {}",
@@ -234,7 +241,11 @@ impl Session {
             .map_err(|e| Error::Exec(format!("cannot describe sandbox {sandbox}: {e}")))?
             .into_body()
             .read_json()
-            .map_err(|e| Error::Exec(format!("sandbox description unreadable: {e}")))?;
+            .map_err(|e| {
+                Error::Exec(format!(
+                    "description of sandbox {sandbox} from {url} unreadable: {e}"
+                ))
+            })?;
         Ok(payload
             .get("data")
             .and_then(|d| d.get("fixRepository"))
@@ -265,13 +276,15 @@ impl Session {
             .header("Content-Type", "application/json")
             .header("X-IBM-wMSUM-P2-SCHEMA", "WM")
             .send_json(inventory)
-            .map_err(|e| Error::Exec(format!("cannot list fixes: {e}")))?
+            .map_err(|e| Error::Exec(format!("cannot list fixes ({url}): {e}")))?
             .into_body()
             .into_reader();
         let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|e| Error::Exec(format!("fix metadata download was cut short: {e}")))?;
+        reader.read_to_end(&mut bytes).map_err(|e| {
+            Error::Exec(format!(
+                "fix metadata download from {url} was cut short: {e}"
+            ))
+        })?;
         Ok(bytes)
     }
 
@@ -290,10 +303,14 @@ impl Session {
             .header("Cookie", "SD_SERVER_ENVIRONMENT_VERSION=1")
             .header("Content-Type", "application/x-www-form-urlencoded")
             .send(format!("locale=en_US&buildNo={DEFAULT_BUILD_NO}"))
-            .map_err(|e| Error::Exec(format!("download handshake failed: {e}")))?
+            .map_err(|e| Error::Exec(format!("download handshake with {cgi} failed: {e}")))?
             .into_body()
             .read_to_string()
-            .map_err(|e| Error::Exec(format!("download handshake unreadable: {e}")))?;
+            .map_err(|e| {
+                Error::Exec(format!(
+                    "download handshake response from {cgi} unreadable: {e}"
+                ))
+            })?;
         let grant = parse_grant(&text).ok_or_else(|| {
             Error::Exec(format!(
                 "download handshake did not return credentials: {}",
