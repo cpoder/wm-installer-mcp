@@ -27,7 +27,7 @@ unpacking archives. It lays down `install/jars/`, including its own jar as
 
 | the work | who does it | what this adds |
 |---|---|---|
-| download from IBM | **native** — there is no local tool to drive | three wire protocols, entitlement-checked, sha256-verified |
+| download from IBM | **native** — there is no local tool to drive | three wire protocols, entitlement-checked, every artifact sha256-verified before it is written |
 | install products | **native** — unpacking signed BM archives | prerequisite closure, dry-run plan |
 | create a p2 profile | **the shipped p2 director** | finds the bootable runtime, builds the command, reports it first |
 | copy a profile elsewhere | **native** — it is a file copy, not a solve | 3 MB archive instead of a 218 MB directory, 0.1 s |
@@ -38,16 +38,29 @@ unpacking archives. It lays down `install/jars/`, including its own jar as
 
 ## Measured
 
-Against IBM's real services and a real installation, not estimated.
+Each figure below was taken today, against IBM's real services and a real
+installation, with the current code — the one that drives the product's own
+tooling. Nothing here is an estimate.
 
-| | |
-|---|---|
-| B2B install, download included | **191 s** (0.90 GB, 138 artifacts) |
-| provision an SPM profile via the shipped director | **21 s**, 498 bundles |
-| create an IS instance via the shipped `is_instance.sh` | **6.8 s** |
-| copy that profile to another machine | **0.1 s** |
-| Trading Networks schema via the shipped configurator | **5 s**, 3 components in dependency order |
-| find and download 6 applicable fixes | **79 s**, sha256-verified |
+| | | runs |
+|---|---|---|
+| provision an SPM profile with the shipped p2 director | **21–27 s**, 498 bundles | 2 |
+| create an IS instance with the shipped `is_instance.sh` | **5–7 s** | 2 |
+| Trading Networks schema with the shipped `dbConfigurator.sh` | **5 s**, 3 components in dependency order | 1 |
+| copy a provisioned profile to another machine | **0.1 s** (3 MB archive) | 1 |
+| find and download 6 applicable fixes from IBM | **79 s**, sha256-verified | 1 |
+
+Ranges are the spread actually observed, not error bars; the run count is
+there so you can weigh them. Two runs of the same profile provisioning came out
+at 21.4 s and 27.3 s on the same machine, which is worth knowing before anyone
+treats any of these as a benchmark.
+
+**Install timing is deliberately not quoted.** An earlier version of this file
+claimed 191 s for a B2B install "download included". That number was measured
+against a partly-warm artifact cache, so it was never a cold figure, and the
+install path has since grown the tooling jars it was missing. A cold re-run is
+outstanding. Rather than publish a number I cannot stand behind, there is none
+here until it is measured properly.
 
 ## Which installs is this for
 
