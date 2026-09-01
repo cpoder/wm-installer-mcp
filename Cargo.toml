@@ -16,8 +16,6 @@ license = "MIT"
 [workspace.dependencies]
 mcp-rt = { path = "crates/mcp-rt" }
 wm-core = { path = "crates/wm-core" }
-
-anyhow = "1"
 base64 = "0.22"
 libc = "0.2"
 regex = "1"

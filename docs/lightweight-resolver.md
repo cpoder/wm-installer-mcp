@@ -1,4 +1,21 @@
-# The lightweight resolver
+# The lightweight resolver — an experiment, not a supported path
+
+> **Read this first.** What follows measures what it takes to replace the p2
+> director's solve with a graph walk. It works, it is fast, and it is **not how
+> you should provision a profile.**
+>
+> The director ships with the product and runs from the installer's own
+> bootstrap runtime at `install/profile`. It takes about twenty seconds, and it
+> produces a profile whose p2 registry IBM's own tooling still recognises — and
+> it runs touchpoint actions such as `replaceTokens` that this resolver does
+> not. `profile_provision` drives it, and `profile_capture` / `profile_replay`
+> copy the result elsewhere in a tenth of a second. That is the supported path,
+> and it is the one to use.
+>
+> This is kept because getting it to agree with the director is the best
+> documentation of webMethods' p2 metadata that exists anywhere — the four
+> sections near the end are the useful part, whatever you provision with.
+
 
 ## When p2 is your problem, and when it is not
 

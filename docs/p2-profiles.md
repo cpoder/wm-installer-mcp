@@ -211,7 +211,14 @@ dry run: 94 file(s) would be written, 1 deleted,
 warning: profile SPM looks like it is running; stop it before applying
 ```
 
-## A lighter resolver — built, and it starts
+## A lighter resolver — built, and demoted
+
+**It works, and it is not the recommended path.** The director ships with the
+product, runs from `install/profile` with no pre-existing profile of its own,
+and takes about twenty seconds — for which you get a p2 registry IBM's tooling
+recognises and the touchpoint actions (`replaceTokens` and friends) that the
+resolver never runs. `profile_provision` drives it. What follows is why the
+experiment was still worth doing.
 
 The section above was written before the thing existed. It does now, it works,
 and the design sketched here turned out to be right about the shape and wrong

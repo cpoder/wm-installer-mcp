@@ -350,8 +350,6 @@ fn collect_scripts(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Split a script into statements.
-///
 /// Statement separators inside string literals, dollar-quoted bodies and
 /// comments are not separators. Getting this wrong does not fail loudly — it
 /// sends half a statement to the server and reports a syntax error pointing at
@@ -429,8 +427,6 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     out
 }
 
-/// Keep a statement, having dropped any line that is a bare `/`.
-///
 /// Several of the shipped PostgreSQL scripts terminate a function body with a
 /// lone `/` on its own line — an Oracle-ism that survived the port. Because it
 /// carries no `;` of its own it is not a separate statement: it lands at the
@@ -461,6 +457,154 @@ fn version_key(version: &str) -> Vec<u64> {
         }
     }
     out
+}
+
+/// How to invoke the shipped configurator for one component.
+///
+/// The product installs `common/db/bin/dbConfigurator.sh`, its Java classes and
+/// its JDBC drivers. Reimplementing what they do would mean a statement
+/// splitter and a driver for each of the six engines webMethods supports — and,
+/// worse, a schema IBM did not create and will not support. So this builds the
+/// command and runs it; the schema stays the vendor's work.
+#[derive(Debug, Clone, Serialize)]
+pub struct Invocation {
+    /// The script to run.
+    pub program: PathBuf,
+    /// Its arguments, in order.
+    pub args: Vec<String>,
+    /// `JAVA_HOME`, which the script requires and does not set itself.
+    pub java_home: PathBuf,
+}
+
+impl Invocation {
+    /// Render the command for display, with the password masked.
+    pub fn display(&self) -> String {
+        let mut out = self.program.display().to_string();
+        let mut mask_next = false;
+        for arg in &self.args {
+            if std::mem::take(&mut mask_next) {
+                out.push_str(" ******");
+                continue;
+            }
+            mask_next = matches!(arg.as_str(), "--password" | "--adminPassword");
+            out.push(' ');
+            out.push_str(arg);
+        }
+        out
+    }
+}
+
+/// Connection and placement settings, passed through to the configurator.
+#[derive(Debug, Clone, Default)]
+pub struct Connection {
+    /// JDBC URL, e.g. `jdbc:wm:postgresql://host:5432;DatabaseName=wmdb`.
+    pub url: String,
+    pub user: String,
+    pub password: String,
+    pub admin_user: Option<String>,
+    pub admin_password: Option<String>,
+    pub tablespace_dir: Option<String>,
+    pub tablespace_data: Option<String>,
+    pub tablespace_index: Option<String>,
+    pub tablespace_blob: Option<String>,
+    pub bufferpool: Option<String>,
+}
+
+/// Locate the shipped configurator and the JVM that runs it.
+pub fn configurator(wm_home: &Path) -> Result<(PathBuf, PathBuf)> {
+    let script = wm_home
+        .join("common")
+        .join("db")
+        .join("bin")
+        .join("dbConfigurator.sh");
+    if !script.is_file() {
+        return Err(Error::Malformed(format!(
+            "{} is missing; install DatabaseComponentConfigurator first",
+            script.display()
+        )));
+    }
+    // The script checks JAVA_HOME and refuses without it, but the product ships
+    // its own JVM, so there is no reason to depend on the caller's.
+    let java_home = wm_home.join("jvm").join("jvm");
+    if !java_home.join("bin").join("java").is_file() {
+        return Err(Error::Malformed(format!(
+            "no JVM at {}; the configurator cannot run",
+            java_home.display()
+        )));
+    }
+    Ok((script, java_home))
+}
+
+/// Build the invocation that installs one component.
+pub fn invocation(
+    wm_home: &Path,
+    component: &Component,
+    database: &str,
+    connection: &Connection,
+) -> Result<Invocation> {
+    let (program, java_home) = configurator(wm_home)?;
+    let mut args = vec![
+        "--action".into(),
+        "create".into(),
+        "--dbms".into(),
+        database.to_string(),
+        "--component".into(),
+        component.name.clone(),
+        // `latest` lets the configurator pick the create set and walk the
+        // migration chain itself, which is exactly what it is for.
+        "--version".into(),
+        "latest".into(),
+        "--url".into(),
+        connection.url.clone(),
+        "--user".into(),
+        connection.user.clone(),
+        "--password".into(),
+        connection.password.clone(),
+    ];
+    for (flag, value) in [
+        ("--adminUser", &connection.admin_user),
+        ("--adminPassword", &connection.admin_password),
+        ("--tablespaceDir", &connection.tablespace_dir),
+        ("--tablespaceForData", &connection.tablespace_data),
+        ("--tablespaceForIndex", &connection.tablespace_index),
+        ("--tablespaceForBlob", &connection.tablespace_blob),
+        ("--bufferpool", &connection.bufferpool),
+    ] {
+        if let Some(value) = value {
+            args.push(flag.into());
+            args.push(value.clone());
+        }
+    }
+    Ok(Invocation {
+        program,
+        args,
+        java_home,
+    })
+}
+
+/// Run one invocation and return its output.
+pub fn run(invocation: &Invocation) -> Result<(bool, String)> {
+    let output = std::process::Command::new(&invocation.program)
+        .args(&invocation.args)
+        .env("JAVA_HOME", &invocation.java_home)
+        // The script resolves its own location relatively.
+        .current_dir(
+            invocation
+                .program
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        )
+        .output()
+        .map_err(|e| Error::Exec(format!("cannot run {}: {e}", invocation.program.display())))?;
+
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let errors = String::from_utf8_lossy(&output.stderr);
+    if !errors.trim().is_empty() {
+        text.push_str(&errors);
+    }
+    // The script exits 0 even on a failed action, so the transcript decides.
+    let ok = output.status.success() && text.contains("status         : complete");
+    Ok((ok, text))
 }
 
 #[cfg(test)]
@@ -578,180 +722,5 @@ mod tests {
         let mut vs = ["10.5.fix10", "10.5", "10.5.fix2", "10.7", "9.12"];
         vs.sort_by_key(|a| version_key(a));
         assert_eq!(vs, ["9.12", "10.5", "10.5.fix2", "10.5.fix10", "10.7"]);
-    }
-}
-
-/// Where to install a schema.
-#[derive(Debug, Clone)]
-pub struct Target {
-    pub host: String,
-    pub port: u16,
-    pub database: String,
-    pub user: String,
-    pub password: String,
-}
-
-impl Target {
-    fn connection_string(&self) -> String {
-        format!(
-            "host={} port={} dbname={} user={} password={}",
-            self.host, self.port, self.database, self.user, self.password
-        )
-    }
-}
-
-/// What applying a plan actually did.
-#[derive(Debug, Clone, Serialize)]
-pub struct Applied {
-    pub component: String,
-    pub code: String,
-    pub from: Option<String>,
-    pub to: String,
-    pub scripts: usize,
-    pub statements: usize,
-    /// True when the schema was already at the target and nothing ran.
-    pub skipped: bool,
-}
-
-/// Open a connection.
-pub fn connect(target: &Target) -> Result<postgres::Client> {
-    postgres::Client::connect(&target.connection_string(), postgres::NoTls)
-        .map_err(|e| Error::Exec(format!("cannot connect to {}: {e}", target.host)))
-}
-
-/// Read the level of every installed component.
-///
-/// Returns nothing at all when the tracking table does not exist yet, which is
-/// the normal state of an empty database rather than an error.
-pub fn installed(client: &mut postgres::Client) -> Result<BTreeMap<String, String>> {
-    let exists: bool = client
-        .query_one("SELECT to_regclass('component_event') IS NOT NULL", &[])
-        .map_err(|e| Error::Exec(format!("cannot inspect the database: {e}")))?
-        .get(0);
-    if !exists {
-        return Ok(BTreeMap::new());
-    }
-    let rows = client
-        .query(
-            "SELECT component_cd, component_level FROM installed_component",
-            &[],
-        )
-        .map_err(|e| Error::Exec(format!("cannot read installed_component: {e}")))?;
-    Ok(rows
-        .iter()
-        .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
-        .collect())
-}
-
-/// Run a plan against a database and record the result.
-///
-/// Each script runs in its own transaction, so a failure leaves the database at
-/// the last script that fully succeeded rather than half-way through one — and
-/// the error names the file and the statement, which is the thing the shipped
-/// configurator does not tell you.
-pub fn apply(client: &mut postgres::Client, plan: &Plan, already: Option<&str>) -> Result<Applied> {
-    if already == Some(plan.target.as_str()) {
-        return Ok(Applied {
-            component: plan.component.clone(),
-            code: plan.code.clone(),
-            from: already.map(str::to_string),
-            to: plan.target.clone(),
-            scripts: 0,
-            statements: 0,
-            skipped: true,
-        });
-    }
-    if let Some(level) = already {
-        return Err(Error::Exec(format!(
-            "{} is already installed at {level}; migrating an existing schema in place is not \
-             supported here — take a backup and run the migration steps deliberately",
-            plan.component
-        )));
-    }
-
-    let mut statements = 0usize;
-    for script in &plan.scripts {
-        let sql = fs::read_to_string(script).map_err(|e| Error::io(script.clone(), e))?;
-        let mut transaction = client
-            .transaction()
-            .map_err(|e| Error::Exec(format!("cannot begin a transaction: {e}")))?;
-        for statement in split_statements(&sql) {
-            transaction.batch_execute(&statement).map_err(|e| {
-                Error::Exec(format!(
-                    "{}: {}\n  while running: {}",
-                    script.display(),
-                    describe(&e),
-                    first_line(&statement)
-                ))
-            })?;
-            statements += 1;
-        }
-        transaction
-            .commit()
-            .map_err(|e| Error::Exec(format!("{}: cannot commit: {e}", script.display())))?;
-    }
-
-    record(client, &plan.code, &plan.component, &plan.target)?;
-
-    Ok(Applied {
-        component: plan.component.clone(),
-        code: plan.code.clone(),
-        from: None,
-        to: plan.target.clone(),
-        scripts: plan.scripts.len(),
-        statements,
-        skipped: false,
-    })
-}
-
-/// Write the `INSTALL` event every webMethods product reads to learn the level.
-pub fn record(
-    client: &mut postgres::Client,
-    code: &str,
-    description: &str,
-    level: &str,
-) -> Result<()> {
-    client
-        .execute(
-            "INSERT INTO component_event \
-             (component_cd, component_desc, component_event, component_level) \
-             VALUES ($1, $2, 'INSTALL', $3)",
-            &[&code, &description, &level],
-        )
-        .map_err(|e| Error::Exec(format!("cannot record the install of {code}: {e}")))?;
-    Ok(())
-}
-
-/// Render a database error usefully.
-///
-/// `postgres::Error` displays as a bare "db error"; everything that identifies
-/// the problem — the server's message, the position, the hint — is in the
-/// `DbError` behind it.
-fn describe(error: &postgres::Error) -> String {
-    match error.as_db_error() {
-        Some(db) => {
-            let mut text = format!("{}: {}", db.severity(), db.message());
-            if let Some(detail) = db.detail() {
-                text.push_str(&format!(" ({detail})"));
-            }
-            if let Some(hint) = db.hint() {
-                text.push_str(&format!(" [hint: {hint}]"));
-            }
-            text
-        }
-        None => error.to_string(),
-    }
-}
-
-fn first_line(statement: &str) -> String {
-    let line = statement
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("");
-    let line = line.trim();
-    if line.len() > 90 {
-        format!("{}…", &line[..90])
-    } else {
-        line.to_string()
     }
 }

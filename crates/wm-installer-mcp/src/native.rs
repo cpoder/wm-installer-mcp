@@ -680,87 +680,196 @@ pub fn database_plan() -> Tool {
     )
 }
 
-/// Create database schemas.
+/// Create database schemas by driving the shipped configurator.
 pub fn database_configure() -> Tool {
     Tool::new(
         "database_configure",
-        "Create the database schemas a product needs, natively — no JVM, no JDBC drivers, no \
-         dbConfigurator.sh. Runs each component's create set and then its migration chain, one \
-         transaction per script, and records the INSTALL event in COMPONENT_EVENT that every \
-         webMethods product reads to learn what level its schema is at. ComponentTracker is \
-         always installed first because nothing can be recorded without it. Defaults to a dry \
-         run. PostgreSQL only for now: the plan is computed for any database, but only \
-         PostgreSQL is executed here.",
+        "Create the database schemas a product needs, by running the product's own \
+         common/db/bin/dbConfigurator.sh with the product's own JVM. The schema is never \
+         reimplemented here: IBM ships the configurator, its Java classes and its JDBC drivers \
+         with the installation, and a schema it created is one IBM supports. What this adds is \
+         the orchestration the shipped tool leaves to the caller — pulling in each component's \
+         declared prerequisites, ordering them, and reporting the exact commands before running \
+         any of them. Every database webMethods supports works, because the tool doing the work \
+         is the vendor's. Defaults to a dry run.",
         json!({
             "type": "object",
-            "required": ["wm_home", "components", "host", "database_name", "user", "password"],
+            "required": ["wm_home", "components", "database", "url", "user", "password"],
             "properties": {
-                "wm_home": { "type": "string", "description": "Installation whose scripts to use." },
-                "components": { "type": "array", "items": { "type": "string" }, "description": "Component names, e.g. TradingNetworks." },
-                "host": { "type": "string" },
-                "port": { "type": "integer", "description": "Default 5432." },
-                "database_name": { "type": "string", "description": "The database to install into; it must already exist." },
+                "wm_home": { "type": "string", "description": "Installation whose configurator to run." },
+                "components": { "type": "array", "items": { "type": "string" }, "description": "Component names, e.g. TradingNetworks. Prerequisites are added automatically." },
+                "database": { "type": "string", "description": "postgresql, oracle, sqlserver, db2, mysql or sybase." },
+                "url": { "type": "string", "description": "JDBC URL, e.g. jdbc:wm:postgresql://host:5432;DatabaseName=wmdb" },
                 "user": { "type": "string" },
                 "password": { "type": "string" },
-                "apply": { "type": "boolean", "description": "Set true to write; otherwise a dry run." }
+                "admin_user": { "type": "string", "description": "Database administrator account, when the action needs one." },
+                "admin_password": { "type": "string" },
+                "tablespace_dir": { "type": "string" },
+                "tablespace_data": { "type": "string" },
+                "tablespace_index": { "type": "string" },
+                "tablespace_blob": { "type": "string" },
+                "bufferpool": { "type": "string" },
+                "apply": { "type": "boolean", "description": "Set true to run; otherwise a dry run listing the commands." }
             }
         }),
         Box::new(|args| {
             let home = PathBuf::from(req_str(args, "wm_home")?);
+            let database = req_str(args, "database")?;
             let wanted = str_list(args, "components");
             if wanted.is_empty() {
                 return Err(ToolError::invalid("name at least one component"));
             }
-            let target = wm_core::database::Target {
-                host: req_str(args, "host")?,
-                port: args.get("port").and_then(|p| p.as_u64()).unwrap_or(5432) as u16,
-                database: req_str(args, "database_name")?,
+            let connection = wm_core::database::Connection {
+                url: req_str(args, "url")?,
                 user: req_str(args, "user")?,
                 password: req_str(args, "password")?,
+                admin_user: opt_str(args, "admin_user"),
+                admin_password: opt_str(args, "admin_password"),
+                tablespace_dir: opt_str(args, "tablespace_dir"),
+                tablespace_data: opt_str(args, "tablespace_data"),
+                tablespace_index: opt_str(args, "tablespace_index"),
+                tablespace_blob: opt_str(args, "tablespace_blob"),
+                bufferpool: opt_str(args, "bufferpool"),
             };
-            let components = wm_core::database::discover(&home).map_err(ToolError::failed)?;
 
-            // Prerequisites are pulled in and everything is ordered: the
-            // components are not independent, and installing them in the order
-            // they were asked for only works if the caller already knew it.
+            let components = wm_core::database::discover(&home).map_err(ToolError::failed)?;
+            // Components are not independent: asking for one must install what
+            // it declares as a prerequisite, and in the right order.
             let order =
                 wm_core::database::order(&components, &wanted).map_err(ToolError::failed)?;
-
-            let mut client = wm_core::database::connect(&target).map_err(ToolError::failed)?;
-            let installed = wm_core::database::installed(&mut client).map_err(ToolError::failed)?;
             let dry_run = !flag(args, "apply", false);
 
             let mut done = Vec::new();
             for component in order {
                 let plan =
-                    wm_core::database::plan(component, "postgresql").map_err(ToolError::failed)?;
-                let already = installed.get(&plan.code).map(String::as_str);
+                    wm_core::database::plan(component, &database).map_err(ToolError::failed)?;
+                let invocation =
+                    wm_core::database::invocation(&home, component, &database, &connection)
+                        .map_err(ToolError::failed)?;
                 if dry_run {
                     done.push(json!({
-                        "component": plan.component,
-                        "code": plan.code,
-                        "from": already,
-                        "to": plan.target,
+                        "component": component.name,
+                        "code": component.code,
+                        "target": plan.target,
                         "scripts": plan.scripts.len(),
-                        "skipped": already == Some(plan.target.as_str()),
+                        "command": invocation.display(),
                     }));
                     continue;
                 }
-                let applied = wm_core::database::apply(&mut client, &plan, already)
-                    .map_err(ToolError::failed)?;
-                done.push(serde_json::to_value(&applied).unwrap_or(json!({})));
+                let (ok, transcript) =
+                    wm_core::database::run(&invocation).map_err(ToolError::failed)?;
+                if !ok {
+                    return Err(ToolError::failed(format!(
+                        "{} failed:\n{}",
+                        component.name,
+                        tail(&transcript, 25)
+                    )));
+                }
+                done.push(json!({
+                    "component": component.name,
+                    "code": component.code,
+                    "target": plan.target,
+                    "scripts": plan.scripts.len(),
+                    "status": "complete",
+                }));
             }
 
             let summary = format!(
-                "{}: {} component(s) on {}/{}",
+                "{}: {} component(s) on {database}",
                 if dry_run { "dry run" } else { "configured" },
-                done.len(),
-                target.host,
-                target.database
+                done.len()
             );
             Ok(ToolResult::structured(
                 summary,
                 json!({ "components": done }),
+            ))
+        }),
+    )
+}
+
+/// The last `lines` lines of a transcript, which is where a failure says why.
+fn tail(text: &str, lines: usize) -> String {
+    let all: Vec<&str> = text.lines().collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+/// Provision a profile with the shipped p2 director.
+pub fn profile_provision() -> Tool {
+    Tool::new(
+        "profile_provision",
+        "Create an Eclipse p2 profile the supported way: by running the product's own p2 \
+         director, from the product's own JVM and launcher, both of which ship with the \
+         installation and need no pre-existing profile. Takes about thirty seconds, and that is \
+         the price of a profile whose p2 registry IBM's own tooling still recognises. Use \
+         profile_capture and profile_replay to copy the result to other machines in a fraction \
+         of a second. Defaults to a dry run that prints the command.",
+        json!({
+            "type": "object",
+            "required": ["wm_home", "profile", "roots"],
+            "properties": {
+                "wm_home": { "type": "string", "description": "Installation whose director and repositories to use." },
+                "profile": { "type": "string", "description": "Profile name, e.g. SPM." },
+                "destination": { "type": "string", "description": "Where to create it; defaults to <wm_home>/profiles/<profile>." },
+                "roots": { "type": "array", "items": { "type": "string" }, "description": "Root features. A `.feature.group` suffix is added if missing." },
+                "os": { "type": "string", "description": "Default linux." },
+                "ws": { "type": "string", "description": "Default gtk." },
+                "arch": { "type": "string", "description": "Default x86_64." },
+                "apply": { "type": "boolean", "description": "Set true to run; otherwise a dry run." }
+            }
+        }),
+        Box::new(|args| {
+            let home = PathBuf::from(req_str(args, "wm_home")?);
+            let profile = req_str(args, "profile")?;
+            let destination = opt_str(args, "destination")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("profiles").join(&profile));
+            let roots = str_list(args, "roots");
+            if roots.is_empty() {
+                return Err(ToolError::invalid("name at least one root feature"));
+            }
+            let env = wm_core::resolve::Environment {
+                os: opt_str(args, "os").unwrap_or_else(|| "linux".into()),
+                ws: opt_str(args, "ws").unwrap_or_else(|| "gtk".into()),
+                arch: opt_str(args, "arch").unwrap_or_else(|| "x86_64".into()),
+            };
+
+            let invocation =
+                wm_core::profile::director::invocation(&home, &destination, &profile, &roots, &env)
+                    .map_err(ToolError::failed)?;
+            if !flag(args, "apply", false) {
+                return Ok(ToolResult::structured(
+                    format!(
+                        "dry run: would provision {profile} into {}",
+                        destination.display()
+                    ),
+                    json!({ "command": invocation.display() }),
+                ));
+            }
+
+            let started = std::time::Instant::now();
+            let (ok, transcript) =
+                wm_core::profile::director::run(&invocation).map_err(ToolError::failed)?;
+            if !ok {
+                return Err(ToolError::failed(format!(
+                    "the director failed:\n{}",
+                    tail(&transcript, 25)
+                )));
+            }
+            let bundles = destination
+                .join("configuration/org.eclipse.equinox.simpleconfigurator/bundles.info");
+            let count = std::fs::read_to_string(&bundles)
+                .map(|t| {
+                    t.lines()
+                        .filter(|l| !l.starts_with('#') && l.contains(','))
+                        .count()
+                })
+                .unwrap_or(0);
+            Ok(ToolResult::structured(
+                format!(
+                    "provisioned {profile}: {count} bundle(s) in {:.1}s",
+                    started.elapsed().as_secs_f64()
+                ),
+                json!({ "profile": profile, "destination": destination, "bundles": count }),
             ))
         }),
     )

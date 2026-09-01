@@ -664,3 +664,161 @@ mod tests {
         assert!(out.contains("b={{WM_HOME}}/common"));
     }
 }
+
+/// Provision a profile with the product's own p2 director.
+///
+/// The director, its launcher and a JVM all ship with the installation, and
+/// nothing about running them needs a profile to exist first — the launcher
+/// lives in `common/runtime/bundles/platform/eclipse/plugins`. So this is the
+/// supported way to create a profile, and it is the default here.
+///
+/// It costs about thirty seconds. That is the price of a profile whose p2
+/// registry IBM's own tooling will still recognise, and it is worth paying.
+pub mod director {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use serde::Serialize;
+
+    use crate::error::{Error, Result};
+
+    /// A director invocation, before it is run.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct Invocation {
+        pub java: PathBuf,
+        pub launcher: PathBuf,
+        pub args: Vec<String>,
+    }
+
+    impl Invocation {
+        pub fn display(&self) -> String {
+            format!(
+                "{} -jar {} {}",
+                self.java.display(),
+                self.launcher.display(),
+                self.args.join(" ")
+            )
+        }
+    }
+
+    /// Find the launcher of a *bootable* Eclipse, which is not the same thing
+    /// as finding a launcher jar.
+    ///
+    /// `common/runtime/bundles/platform/eclipse/plugins` holds the launcher and
+    /// the director, but that directory is a p2 repository, not an
+    /// installation: it has no `configuration/config.ini`, and running from it
+    /// fails with "Unable to acquire application service". The installer runs
+    /// p2 from its own bootstrap profile at `install/profile`, and so does
+    /// this.
+    pub fn launcher(wm_home: &Path) -> Result<PathBuf> {
+        let plugins = wm_home.join("install").join("profile").join("plugins");
+        if !plugins
+            .join("..")
+            .join("configuration")
+            .join("config.ini")
+            .is_file()
+        {
+            return Err(Error::Malformed(format!(
+                "no bootable p2 runtime at {}; the installer's own profile is what runs the \
+                 director, and this installation does not have one",
+                wm_home.join("install").join("profile").display()
+            )));
+        }
+        let mut found: Vec<PathBuf> = std::fs::read_dir(&plugins)
+            .map_err(|e| Error::io(plugins.clone(), e))?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with("org.eclipse.equinox.launcher_") && n.ends_with(".jar")
+                })
+            })
+            .collect();
+        found.sort();
+        found.pop().ok_or_else(|| {
+            Error::Malformed(format!("no Equinox launcher under {}", plugins.display()))
+        })
+    }
+
+    /// Every p2 repository the installation ships, as `file:` URLs.
+    pub fn repositories(wm_home: &Path) -> Result<Vec<String>> {
+        let root = wm_home.join("common").join("runtime").join("bundles");
+        let mut out = Vec::new();
+        for group in std::fs::read_dir(&root)
+            .map_err(|e| Error::io(root.clone(), e))?
+            .flatten()
+        {
+            let eclipse = group.path().join("eclipse");
+            if eclipse.join("content.xml").is_file() {
+                out.push(format!("file:{}", eclipse.display()));
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Build the director invocation that provisions `roots` into `destination`.
+    pub fn invocation(
+        wm_home: &Path,
+        destination: &Path,
+        profile: &str,
+        roots: &[String],
+        env: &crate::resolve::Environment,
+    ) -> Result<Invocation> {
+        let java = wm_home.join("jvm").join("jvm").join("bin").join("java");
+        if !java.is_file() {
+            return Err(Error::Malformed(format!(
+                "no JVM at {}; the director cannot run",
+                java.display()
+            )));
+        }
+        let units: Vec<String> = roots
+            .iter()
+            .map(|r| {
+                if r.ends_with(".feature.group") {
+                    r.clone()
+                } else {
+                    format!("{r}.feature.group")
+                }
+            })
+            .collect();
+        Ok(Invocation {
+            java,
+            launcher: launcher(wm_home)?,
+            args: vec![
+                "-application".into(),
+                "org.eclipse.equinox.p2.director".into(),
+                "-repository".into(),
+                repositories(wm_home)?.join(","),
+                "-installIU".into(),
+                units.join(","),
+                "-destination".into(),
+                destination.display().to_string(),
+                "-profile".into(),
+                profile.to_string(),
+                "-profileProperties".into(),
+                "org.eclipse.update.install.features=true".into(),
+                "-p2.os".into(),
+                env.os.clone(),
+                "-p2.ws".into(),
+                env.ws.clone(),
+                "-p2.arch".into(),
+                env.arch.clone(),
+                "-roaming".into(),
+            ],
+        })
+    }
+
+    /// Run it, returning whether it succeeded and what it said.
+    pub fn run(invocation: &Invocation) -> Result<(bool, String)> {
+        let output = Command::new(&invocation.java)
+            .arg("-jar")
+            .arg(&invocation.launcher)
+            .args(&invocation.args)
+            .output()
+            .map_err(|e| Error::Exec(format!("cannot run the p2 director: {e}")))?;
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok((output.status.success(), text))
+    }
+}

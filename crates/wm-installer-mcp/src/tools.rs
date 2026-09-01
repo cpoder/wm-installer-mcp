@@ -31,6 +31,7 @@ pub fn server() -> Server {
         .tool(crate::native::sdc_releases())
         .tool(crate::native::sdc_catalog())
         .tool(crate::native::native_plan())
+        .tool(crate::native::profile_provision())
         .tool(crate::native::database_plan())
         .tool(crate::native::database_configure())
         .tool(crate::native::native_install())
