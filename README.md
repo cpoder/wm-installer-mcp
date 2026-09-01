@@ -49,18 +49,26 @@ tooling. Nothing here is an estimate.
 | Trading Networks schema with the shipped `dbConfigurator.sh` | **5 s**, 3 components in dependency order | 1 |
 | copy a provisioned profile to another machine | **0.1 s** (3 MB archive) | 1 |
 | find and download 6 applicable fixes from IBM | **79 s**, sha256-verified | 1 |
+| B2B install from nothing, download included | **261 s** — 0.81 GB, 125 artifacts, 81 tooling jars | 1 |
 
 Ranges are the spread actually observed, not error bars; the run count is
 there so you can weigh them. Two runs of the same profile provisioning came out
 at 21.4 s and 27.3 s on the same machine, which is worth knowing before anyone
 treats any of these as a benchmark.
 
-**Install timing is deliberately not quoted.** An earlier version of this file
-claimed 191 s for a B2B install "download included". That number was measured
-against a partly-warm artifact cache, so it was never a cold figure, and the
-install path has since grown the tooling jars it was missing. A cold re-run is
-outstanding. Rather than publish a number I cannot stand behind, there is none
-here until it is measured properly.
+The install figure is now a genuine cold one: empty artifact cache, empty
+destination, `TNServer` + `EDIINT` + `PIECore` + `integrationServer` closing to
+54 products. An earlier version of this file claimed **191 s** for the same
+thing; that number was taken against a partly-warm cache and was never a cold
+measurement. The real figure is slower, and the install also does more now — it
+lays down the 81 tooling jars it used to skip.
+
+One cold run before this one failed part-way, at `Modes::read`, with an
+incomplete deflate stream. It did not reproduce, and the obvious explanations do
+not hold: the bytes had passed their sha256 before being written, the filesystem
+had 780 GB free, and no other job shared the cache. It is recorded here rather
+than quietly dropped, and the error message now names the archive and its size
+so a recurrence has something to go on.
 
 ## Which installs is this for
 

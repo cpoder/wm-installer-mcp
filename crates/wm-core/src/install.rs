@@ -348,9 +348,18 @@ impl Modes {
             return Ok(Self::default());
         };
         let mut text = String::new();
-        entry
-            .read_to_string(&mut text)
-            .map_err(|e| Error::Exec(format!("comment block unreadable: {e}")))?;
+        // Name the archive and its size. A failure here has been seen once,
+        // was not reproducible, and could not be attributed: the bytes had
+        // already passed their sha256 before being written, the filesystem had
+        // 780 GB free, and no other job shared the cache. Without the archive
+        // name in the message there was nothing left to investigate with.
+        entry.read_to_string(&mut text).map_err(|e| {
+            let size = fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
+            Error::Exec(format!(
+                "comment block of {} ({size} bytes) unreadable: {e}",
+                archive.display()
+            ))
+        })?;
         Ok(Self::parse(&text))
     }
 
