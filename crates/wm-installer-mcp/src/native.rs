@@ -19,7 +19,17 @@ fn state_dir() -> PathBuf {
         })
 }
 
-fn jobs_dir() -> PathBuf {
+/// Where jobs live. The single definition: a job written somewhere the status
+/// call does not look is a job that cannot be followed, and there were two of
+/// these disagreeing whenever WM_STATE_DIR was set.
+pub fn jobs_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("WM_JOBS_DIR") {
+        return PathBuf::from(dir);
+    }
+    jobs_dir_inner()
+}
+
+fn jobs_dir_inner() -> PathBuf {
     std::env::var("WM_JOBS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| state_dir().join("jobs"))
@@ -455,9 +465,49 @@ pub fn instance_create() -> Tool {
             let invocation = wm_core::instance::ant::create(&wm_home, &name, &options)
                 .map_err(ToolError::failed)?;
             if !flag(args, "apply", false) {
+                // The Ant script supplies its own defaults for anything not
+                // passed, so say what those are rather than leaving a blank.
+                let mut settings = Vec::new();
+                setting(&mut settings, "name", &name, args.get("name").is_some());
+                for (key, default) in [
+                    ("primary_port", "5555"),
+                    ("secure_port", "5543"),
+                    ("diagnostic_port", "9999"),
+                    ("jmx_port", "8075"),
+                ] {
+                    match args.get(key).and_then(|v| v.as_u64()) {
+                        Some(v) => setting(&mut settings, key, v, true),
+                        None => setting(&mut settings, key, default, false),
+                    }
+                }
+                setting(
+                    &mut settings,
+                    "admin_password",
+                    if options.admin_password.is_some() {
+                        "as given"
+                    } else {
+                        "the password set when the product was installed"
+                    },
+                    options.admin_password.is_some(),
+                );
+                setting(
+                    &mut settings,
+                    "database",
+                    options.db_type.as_deref().unwrap_or("embedded"),
+                    options.db_type.is_some(),
+                );
+                setting(
+                    &mut settings,
+                    "bind_address",
+                    options.bind_address.as_deref().unwrap_or("every interface"),
+                    options.bind_address.is_some(),
+                );
                 return Ok(ToolResult::structured(
-                    format!("dry run: would create instance {name}"),
-                    json!({ "command": invocation.display() }),
+                    format!(
+                        "dry run: would create instance {name}. Put the settings below to the \
+                         user, confirm or amend them, then call again with apply=true."
+                    ),
+                    json!({ "command": invocation.display(), "settings": settings }),
                 ));
             }
             let started = std::time::Instant::now();
@@ -626,8 +676,13 @@ pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
     };
     let tree = ProductTree::parse(&text).map_err(|e| e.to_string())?;
 
+    let job_dir = std::env::var("WM_JOB_DIR").map(PathBuf::from).ok();
     let artifacts = tree.artifacts_for_selection(products.iter().map(String::as_str));
     let total: u64 = artifacts.iter().filter_map(|a| a.compressed_size).sum();
+    let mut progress = wm_core::progress::Progress::new("downloading", artifacts.len(), total);
+    if let Some(dir) = &job_dir {
+        progress.write(dir);
+    }
     println!(
         "{} products, {} artifacts, {:.2} GB to fetch into {}",
         products.len(),
@@ -649,6 +704,9 @@ pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
         install::write_contents(&install_dir, artifact, &unpacked).map_err(|e| e.to_string())?;
         done += 1;
         bytes += fetched.size;
+        if let Some(dir) = &job_dir {
+            progress.step(&artifact.name, fetched.size, dir);
+        }
         println!(
             "[{done}/{}] {} {} -> {} file(s)",
             artifacts.len(),
@@ -672,6 +730,10 @@ pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
     );
     let jar_dir = install_dir.join("install").join("jars");
     std::fs::create_dir_all(&jar_dir).map_err(|e| e.to_string())?;
+    if let Some(dir) = &job_dir {
+        let jar_bytes: u64 = jars.iter().filter_map(|j| j.compressed_size).sum();
+        progress.phase("tooling jars", jars.len(), jar_bytes, dir);
+    }
     let mut jars_done = 0usize;
     for jar in &jars {
         let fetched = install::fetch(&mut session, &cgi, &repository, jar, &cache)
@@ -684,6 +746,9 @@ pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
         std::fs::copy(&fetched.path, jar_dir.join(&name)).map_err(|e| e.to_string())?;
         jars_done += 1;
         bytes += fetched.size;
+        if let Some(dir) = &job_dir {
+            progress.step(&jar.name, fetched.size, dir);
+        }
     }
     // `install/jars/DistMan.jar` is the installer's own jar, which the
     // installer lays down under that name. It is not in the product catalogue,
@@ -715,10 +780,14 @@ pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
     for product in &products {
         install::write_prop(&install_dir, product, &tree).map_err(|e| e.to_string())?;
     }
-    println!(
-        "installed {done} artifact(s) and {jars_done} jar(s), {:.2} GB",
-        bytes as f64 / 1e9
+    let summary = format!(
+        "installed {done} artifact(s) and {jars_done} jar(s), {}",
+        wm_core::progress::human_bytes(bytes)
     );
+    if let Some(dir) = &job_dir {
+        progress.finish(true, &summary, dir);
+    }
+    println!("{summary}");
 
     let panels: Vec<&String> = products
         .iter()
@@ -895,6 +964,20 @@ pub fn database_configure() -> Tool {
             ))
         }),
     )
+}
+
+/// Record a setting and where its value came from.
+///
+/// A dry run that lists only what will happen still hides half the decision:
+/// the caller cannot tell which values it chose and which the tool chose for
+/// it. Every default is reported explicitly so the agent can put them to the
+/// user before anything runs.
+fn setting(into: &mut Vec<Value>, name: &str, value: impl std::fmt::Display, from_caller: bool) {
+    into.push(json!({
+        "setting": name,
+        "value": value.to_string(),
+        "source": if from_caller { "you asked for it" } else { "default" },
+    }));
 }
 
 /// The last `lines` lines of a transcript, which is where a failure says why.

@@ -24,6 +24,7 @@ pub mod instance;
 pub mod inventory;
 pub mod password;
 pub mod profile;
+pub mod progress;
 pub mod resolve;
 pub mod runner;
 pub mod script;

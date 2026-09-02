@@ -104,6 +104,13 @@ pub fn run(
 ) -> Result<Output> {
     let dir = std::env::temp_dir().join(format!("wm-core-run-{}", unique_suffix()));
     fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+    // The child needs to find its own directory to publish progress into; it
+    // cannot derive it, because the id is minted here.
+    let mut env = env.clone();
+    env.extra
+        .push(("WM_JOB_DIR".to_string(), dir.display().to_string()));
+    let env = &env;
+
     let log = dir.join("output.log");
     let file = fs::File::create(&log).map_err(|e| Error::io(&log, e))?;
     let errors = file.try_clone().map_err(|e| Error::io(&log, e))?;
@@ -206,6 +213,13 @@ pub fn spawn(
     let id = format!("{label}-{}", unique_suffix());
     let dir = jobs_dir.join(&id);
     fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+
+    // The child needs to find its own directory to publish progress into; it
+    // cannot derive it, because the id is minted here.
+    let mut env = env.clone();
+    env.extra
+        .push(("WM_JOB_DIR".to_string(), dir.display().to_string()));
+    let env = &env;
 
     let log = dir.join("output.log");
     let exit_file = dir.join("exit_code");

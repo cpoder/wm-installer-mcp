@@ -49,19 +49,20 @@ tooling. Nothing here is an estimate.
 | Trading Networks schema with the shipped `dbConfigurator.sh` | **5 s**, 3 components in dependency order | 1 |
 | copy a provisioned profile to another machine | **0.1 s** (3 MB archive) | 1 |
 | find and download 6 applicable fixes from IBM | **79 s**, sha256-verified | 1 |
-| B2B install from nothing, download included | **261 s** — 0.81 GB, 125 artifacts, 81 tooling jars | 1 |
+| B2B install from nothing, download included | **3m 36s – 4m 21s** — 816 MB, 125 artifacts, 81 tooling jars | 3 |
 
 Ranges are the spread actually observed, not error bars; the run count is
 there so you can weigh them. Two runs of the same profile provisioning came out
 at 21.4 s and 27.3 s on the same machine, which is worth knowing before anyone
 treats any of these as a benchmark.
 
-The install figure is now a genuine cold one: empty artifact cache, empty
+The install figures are genuine cold ones: empty artifact cache, empty
 destination, `TNServer` + `EDIINT` + `PIECore` + `integrationServer` closing to
-54 products. An earlier version of this file claimed **191 s** for the same
-thing; that number was taken against a partly-warm cache and was never a cold
-measurement. The real figure is slower, and the install also does more now — it
-lays down the 81 tooling jars it used to skip.
+54 products. Three runs came out at 3m 36s, 3m 57s and 4m 21s — the spread is
+download throughput, which varied between 2.6 and 3.8 MB/s. An earlier version
+of this file claimed **191 s**; that was taken against a partly-warm cache and
+never measured what it said. The honest figure is slower, and the install also
+does more now — it lays down the 81 tooling jars it used to skip.
 
 One cold run before this one failed part-way, at `Modes::read`, with an
 incomplete deflate stream. It did not reproduce, and the obvious explanations do
@@ -69,6 +70,86 @@ not hold: the bytes had passed their sha256 before being written, the filesystem
 had 780 GB free, and no other job shared the cache. It is recorded here rather
 than quietly dropped, and the error message now names the archive and its size
 so a recurrence has something to go on.
+
+## Watching it work
+
+A cold install takes about four minutes. Until recently the only feedback was
+the tail of a log, which tells a person little and gives an agent nothing it can
+render. A job now publishes `progress.json` beside its log, and there are two
+ways to read it.
+
+**At a terminal**, `--watch` draws the job and redraws in place:
+
+```console
+$ wm-installer-mcp --watch native-3078062-1788386815569-0
+  BM_OSGiMigration-ALL-Any
+  native-3078062-1788386815569-0
+
+  █████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░   43%
+
+  phase      downloading
+  step       61 of 125
+  fetched    350 MB of 812 MB  (3.80 MB/s)
+  elapsed    1m 32s
+  remaining  about 2m 01s
+
+  BM_OSGiMigration-UNIX-Any
+```
+
+and when it lands:
+
+```console
+  ████████████████████████████████████████████████  100%
+
+  phase      tooling jars
+  step       80 of 80
+  fetched    816 MB of 816 MB  (3.78 MB/s)
+  elapsed    3m 36s
+  state      done
+
+  ZSLOSGIInstallMessages-ALL-Any
+
+  installed 125 artifact(s) and 81 jar(s), 816 MB
+```
+
+**From an agent**, `job_status` returns the same figures as structured data, and
+its one-line summary is written to be relayed verbatim:
+
+```text
+native-3078062-1788386815569-0: downloading — 43% (350 MB of 812 MB), 1m 32s elapsed, about 2m 01s left
+```
+
+Progress is measured in bytes rather than steps, because artifacts differ in
+size by two orders of magnitude and a step count runs far ahead of the work. The
+total is an estimate that revises itself: the product tree declares no size for
+resource jars, so the real figure overshoots the plan, and the bar corrects
+rather than reading 816 MB of 812 MB.
+
+## Defaults are shown, not assumed
+
+Every tool that changes anything defaults to a dry run, and the dry run names
+each setting and where its value came from:
+
+```console
+$ instance_create wm_home=/opt/webmethods name=demo
+
+dry run: would create instance demo. Put the settings below to the user,
+confirm or amend them, then call again with apply=true.
+
+  name             demo                                             you asked for it
+  primary_port     5555                                             default
+  secure_port      5543                                             default
+  diagnostic_port  9999                                             default
+  jmx_port         8075                                             default
+  admin_password   the password set when the product was installed   default
+  database         embedded                                         default
+  bind_address     every interface                                  default
+```
+
+The server's instructions tell the agent to put that list to the user, take any
+corrections, and only then call again with `apply: true`. Ports, instance names
+and install locations all have defaults that are reasonable and frequently wrong
+for a given site, and the user is the only one who knows which.
 
 ## Which installs is this for
 

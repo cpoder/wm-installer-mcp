@@ -20,13 +20,24 @@ const DEFAULT_SERVER_URL: &str = "https://sdc.webmethods.io/cgi-bin/dataserveweb
 pub fn server() -> Server {
     Server::new("wm-installer", env!("CARGO_PKG_VERSION"))
         .instructions(
-            "Drives the IBM webMethods installer without its wizard. Start with \
-             `inventory_read` on a reference installation: it is the only source of the exact \
-             versioned product paths the installer accepts. Then `plan_resolve` to close a \
-             selection over its prerequisites, `script_generate` and `script_validate` to \
-             produce a script the installer will not reject, and `image_build` / `install_run` \
-             to execute. Long operations return a job id — poll it with `job_status`. \
-             `diagnose_log` explains a failed run.",
+            "Installs, provisions and patches IBM webMethods without the setup wizard, and \
+             drives the product's own tooling — the p2 director, dbConfigurator.sh, \
+             is_instance.sh — for everything the installer lays down.\n\n\
+             HOW TO USE THIS SERVER. Every tool that changes anything defaults to a dry run. \
+             The dry run returns a `settings` list naming each value and whether it came from \
+             the caller or from a default. **Show that list to the user in full, ask whether \
+             the defaults suit them or they want any changed, and only then call again with \
+             `apply: true`.** Never apply on the first call. Ports, instance names, install \
+             locations and target platforms all have defaults that are reasonable and often \
+             wrong for a given site; the user is the only one who knows which.\n\n\
+             Long operations return a job id. Poll it with `job_status`, which reports the \
+             phase, bytes fetched against the total, elapsed time and an estimate of what is \
+             left — relay that to the user rather than leaving them without feedback for four \
+             minutes. A person at a terminal can run `wm-installer-mcp --watch <job-id>` for a \
+             live screen. `diagnose_log` explains a failed run.\n\n\
+             For a selection, `inventory_read` on a reference installation gives the exact \
+             versioned product paths, `native_plan` closes it over its prerequisites and prices \
+             the download, and `native_install` performs it.",
         )
         .tool(crate::native::sdc_releases())
         .tool(crate::native::sdc_catalog())
@@ -72,14 +83,7 @@ fn installer_bin(args: &Value) -> Result<PathBuf, ToolError> {
     Ok(path)
 }
 
-fn jobs_dir() -> PathBuf {
-    std::env::var("WM_JOBS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            Path::new(&home).join(".wm-mcp").join("jobs")
-        })
-}
+use crate::native::jobs_dir;
 
 fn load_catalog(args: &Value) -> Result<(PathBuf, Catalog), ToolError> {
     let home = wm_home(args)?;
@@ -626,8 +630,24 @@ fn job_status() -> Tool {
                 }
                 _ => Vec::new(),
             };
+            let progress = wm_core::progress::Progress::read(&dir);
             let summary = match exit_code {
-                None => format!("{id}: running"),
+                None => match &progress {
+                    Some(p) => format!(
+                        "{id}: {} — {:.0}% ({} of {}), {} elapsed{}",
+                        p.phase,
+                        p.fraction() * 100.0,
+                        wm_core::progress::human_bytes(p.bytes_done),
+                        wm_core::progress::human_bytes(p.bytes_total),
+                        wm_core::progress::human_time(p.elapsed()),
+                        match p.remaining() {
+                            Some(left) =>
+                                format!(", about {} left", wm_core::progress::human_time(left)),
+                            None => String::new(),
+                        }
+                    ),
+                    None => format!("{id}: running"),
+                },
                 Some(0) => format!("{id}: finished successfully"),
                 Some(code) => format!(
                     "{id}: failed with exit code {code}, {} known cause(s)",
@@ -636,7 +656,14 @@ fn job_status() -> Tool {
             };
             Ok(ToolResult::structured(
                 summary,
-                json!({ "job_id": id, "state": state, "log": log, "tail": tail, "diagnoses": diagnoses }),
+                json!({
+                    "job_id": id,
+                    "state": state,
+                    "log": log,
+                    "tail": tail,
+                    "diagnoses": diagnoses,
+                    "progress": progress,
+                }),
             ))
         }),
     )
