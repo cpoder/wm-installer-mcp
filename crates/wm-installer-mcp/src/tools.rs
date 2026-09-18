@@ -76,8 +76,10 @@ pub fn server() -> Server {
         .tool(crate::native::database_configure())
         .tool(crate::native::native_install())
         .tool(crate::native::instance_create())
+        .tool(crate::native::instance_update())
         .tool(crate::native::profile_capture())
         .tool(crate::native::profile_replay())
+        .tool(crate::native::install_verify())
         .tool(inventory_read())
         .tool(catalog_search())
         .tool(plan_resolve())
@@ -87,8 +89,24 @@ pub fn server() -> Server {
         .tool(install_run())
         .tool(job_status())
         .tool(diagnose_log())
+        .tool(crate::manage::install_register())
+        .tool(crate::manage::install_list())
+        .tool(crate::manage::install_show())
+        .tool(crate::manage::install_forget())
+        .tool(crate::manage::config_show())
+        .tool(crate::manage::config_set())
+        .tool(crate::manage::credential_set())
+        .tool(crate::manage::credential_list())
+        .tool(crate::manage::credential_remove())
+        .tool(crate::manage::installer_check())
 }
 
+/// The installation a call is about.
+///
+/// Three ways to name one, and the point of the registry is that they are
+/// interchangeable: `install` is always a registered name, `wm_home` is a path
+/// or a registered name, and a session that registered one installation and made
+/// it the default need give neither.
 fn wm_home(args: &Value) -> Result<PathBuf, ToolError> {
     if let Some(name) = opt_str(args, "install") {
         return crate::manage::resolve_home(&name);
@@ -105,10 +123,8 @@ fn wm_home(args: &Value) -> Result<PathBuf, ToolError> {
                 "no installation named: pass wm_home (a path or a registered name) or install \
                  (a registered name), set $WM_HOME, or make one the default with config_set \
                  setting=install. install_list shows what is registered.",
-        .tool(crate::native::instance_update())
             )
         })?;
-        .tool(crate::native::install_verify())
     crate::manage::resolve_home(&given)
 }
 
@@ -227,24 +243,8 @@ fn cached_catalog_with_path(args: &Value) -> Option<(Catalog, PathBuf)> {
         wm_core::tree::ProductTree::parse(&text).ok()?.catalog(),
         path,
     ))
-        .tool(crate::manage::install_register())
-        .tool(crate::manage::install_list())
-        .tool(crate::manage::install_show())
-        .tool(crate::manage::install_forget())
-        .tool(crate::manage::config_show())
-        .tool(crate::manage::config_set())
-        .tool(crate::manage::credential_set())
-        .tool(crate::manage::credential_list())
-        .tool(crate::manage::credential_remove())
-        .tool(crate::manage::installer_check())
 }
 
-/// The installation a call is about.
-///
-/// Three ways to name one, and the point of the registry is that they are
-/// interchangeable: `install` is always a registered name, `wm_home` is a path
-/// or a registered name, and a session that registered one installation and made
-/// it the default need give neither.
 /// What happened to each seed the caller supplied.
 struct Seeds {
     /// Versioned paths to resolve.
@@ -299,6 +299,11 @@ fn environment(args: &Value) -> Environment {
             .unwrap_or_default(),
         stdin_feed: None,
         passthrough: str_list(args, "passthrough_env"),
+        // A script's $WM_EMPOWER_KEY$ placeholder resolves from the job's
+        // environment. When the key lives in the credential store rather than
+        // this process's environment, this is what puts it there — without it
+        // ever reaching the wrapper the job runs from.
+        secret_env: wm_core::secrets::job_environment(),
     }
 }
 
@@ -311,6 +316,7 @@ fn inventory_read() -> Tool {
         json!({
             "type": "object",
             "properties": {
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
                 "wm_home": { "type": "string", "description": "Installation root; defaults to $WM_HOME." },
                 "filter": { "type": "string", "description": "Only products whose component, code or group contains this." }
             }
@@ -353,13 +359,17 @@ fn catalog_search() -> Tool {
             "type": "object",
             "required": ["query"],
             "properties": {
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
                 "wm_home": { "type": "string" },
+                "platform": { "type": "string", "description": "Platform whose cached release catalogue to search alongside the installation's own (default LNXAMD64)." },
+                "release_catalog": { "type": "boolean", "description": "Search the cached release catalogue as well as the installation, so products that exist but are not installed can be found (default true)." },
                 "query": { "type": "string", "description": "Substring matched against component, group and product code." },
                 "limit": { "type": "integer", "description": "Maximum results (default 50)." }
             }
         }),
         Box::new(|args| {
-            let (_, catalog, sources) = load_catalog(args)?;
+            let (home, catalog, sources) = load_catalog(args)?;
+            let installed = Catalog::load(&home).map_err(ToolError::failed)?;
             let query = req_str(args, "query")?.to_lowercase();
             let limit = opt_usize(args, "limit").unwrap_or(50);
             let hits: Vec<Value> = catalog
@@ -378,20 +388,30 @@ fn catalog_search() -> Tool {
                         "code": p.path.code(),
                         "version": p.path.version(),
                         "requires": p.requires,
+                        "installed": installed.contains(&p.path.raw),
                     })
                 })
                 .collect();
+            let already = hits
+                .iter()
+                .filter(|h| h["installed"].as_bool().unwrap_or(false))
+                .count();
             Ok(ToolResult::structured(
                 format!(
                     "{} of {} products match {query:?}; {already} already installed, {} \
                      available to add.\nsearched:\n{}",
                     hits.len(),
-                    catalog.len()
+                    catalog.len(),
+                    hits.len() - already,
+                    sources
+                        .iter()
+                        .map(|s| format!("  {s}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                 ),
                 json!({ "matches": hits, "searched": sources }),
             ))
         }),
-                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
     )
 }
 
@@ -407,16 +427,16 @@ fn plan_resolve() -> Tool {
             "type": "object",
             "required": ["seeds"],
             "properties": {
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
                 "wm_home": { "type": "string" },
-                "seeds": { "type": "array", "items": { "type": "string" }, "description": "Component names (TNServer) or full versioned paths. A path absent from the catalogue is kept verbatim and reported, since some installed products have no .prop file." },
                 "platform": { "type": "string", "description": "Platform whose cached release catalogue to search alongside the installation's own (default LNXAMD64)." },
                 "release_catalog": { "type": "boolean", "description": "Search the cached release catalogue as well as the installation, so products that exist but are not installed can be found (default true)." },
+                "seeds": { "type": "array", "items": { "type": "string" }, "description": "Component names (TNServer) or full versioned paths. A path absent from the catalogue is kept verbatim and reported, since some installed products have no .prop file." },
                 "include_mandatory": { "type": "boolean", "description": "Inject the mandatory base products (default true)." }
             }
         }),
         Box::new(|args| {
-            let (home, catalog, sources) = load_catalog(args)?;
-            let installed = Catalog::load(&home).map_err(ToolError::failed)?;
+            let (_, catalog, sources) = load_catalog(args)?;
             let seeds = str_list(args, "seeds");
             if seeds.is_empty() {
                 return Err(ToolError::invalid("seeds is empty"));
@@ -436,9 +456,7 @@ fn plan_resolve() -> Tool {
                 resolution.len(),
                 added
             );
-                        "installed": installed.contains(&p.path.raw),
             if !seeds.external.is_empty() {
-                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
                 summary.push_str(&format!(
                     "; {} path(s) kept but absent from the catalogue, so not closed over",
                     seeds.external.len()
@@ -466,11 +484,6 @@ fn plan_resolve() -> Tool {
                 summary.push_str(&format!("; {} caveat(s)", resolution.caveats.len()));
             }
             Ok(ToolResult::structured(
-        // A script's $WM_EMPOWER_KEY$ placeholder resolves from the job's
-        // environment. When the key lives in the credential store rather than
-        // this process's environment, this is what puts it there — without it
-        // ever reaching the wrapper the job runs from.
-        secret_env: wm_core::secrets::job_environment(),
                 summary,
                 json!({
                     // A path kept verbatim is an advisory, not an incomplete
@@ -482,10 +495,9 @@ fn plan_resolve() -> Tool {
                     "install_products": resolution.paths(),
                     "external_paths": seeds.external,
                     "unresolved_seeds": seeds.unresolved,
-                "platform": { "type": "string", "description": "Platform whose cached release catalogue to search alongside the installation's own (default LNXAMD64)." },
-                "release_catalog": { "type": "boolean", "description": "Search the cached release catalogue as well as the installation, so products that exist but are not installed can be found (default true)." },
                     "unsatisfied": resolution.unsatisfied,
                     "caveats": resolution.caveats,
+                    "searched": sources,
                 }),
             ))
         }),
@@ -514,7 +526,6 @@ fn script_generate() -> Tool {
                 "write_to": { "type": "string", "description": "Also write the script to this path." }
             }
         }),
-                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
         Box::new(|args| {
             let install_dir = req_str(args, "install_dir")?;
             let products = str_list(args, "products");
@@ -544,7 +555,6 @@ fn script_generate() -> Tool {
                 ),
                 products,
                 extra: Default::default(),
-                    "searched": sources,
                 preamble: vec![
                     "generated by wm-installer-mcp".into(),
                     "$NAME$ placeholders are substituted from the environment at read time".into(),
@@ -656,6 +666,7 @@ fn image_build() -> Tool {
         }),
         Box::new(|args| {
             let installer = installer_bin(args)?;
+            let check = preflight_installer(args, &installer)?;
             let script = req_str(args, "script")?;
             let output = req_str(args, "output")?;
             let platform = opt_str(args, "platform").unwrap_or_else(|| "LNXAMD64".into());
@@ -666,7 +677,6 @@ fn image_build() -> Tool {
                 .into_iter()
                 .filter(|f| f.severity == Severity::Error)
                 .collect();
-            let check = preflight_installer(args, &installer)?;
             if !blocking.is_empty() {
                 return Err(ToolError::failed(format!(
                     "refusing to start: the installer would reject this script ({})",
@@ -697,16 +707,6 @@ fn image_build() -> Tool {
                 &environment(args),
             )
             .map_err(ToolError::failed)?;
-            Ok(ToolResult::structured(
-                format!("image build started as {} -> {output}", job.id),
-                json!({ "job_id": job.id, "job_dir": job.dir, "log": job.log, "command": job.command }),
-            ))
-        }),
-    )
-}
-
-fn install_run() -> Tool {
-    Tool::new(
             let mut summary = format!("image build started as {} -> {output}", job.id);
             if let Some(version) = &check.local {
                 summary.push_str(&format!(" with installer client {version}"));
@@ -714,6 +714,22 @@ fn install_run() -> Tool {
             if let Some(warning) = check.warning() {
                 summary.push_str(&format!("\n\nnote: {warning}"));
             }
+            Ok(ToolResult::structured(
+                summary,
+                json!({
+                    "job_id": job.id,
+                    "job_dir": job.dir,
+                    "log": job.log,
+                    "command": job.command,
+                    "installer": check,
+                }),
+            ))
+        }),
+    )
+}
+
+fn install_run() -> Tool {
+    Tool::new(
         "install_run",
         "Start an installation from a script, optionally from an image. Returns a job id; \
          poll it with job_status. Validates the script first, because the installer only \
@@ -737,6 +753,7 @@ fn install_run() -> Tool {
         }),
         Box::new(|args| {
             let installer = installer_bin(args)?;
+            let check = preflight_installer(args, &installer)?;
             let script = req_str(args, "script")?;
             let parsed = InstallScript::read(Path::new(&script)).map_err(ToolError::failed)?;
             let blocking: Vec<_> = parsed
@@ -753,7 +770,6 @@ fn install_run() -> Tool {
                         .collect::<Vec<_>>()
                         .join("; ")
                 )));
-            let check = preflight_installer(args, &installer)?;
             }
 
             let mut cmd_args = vec!["-console".into(), "-readScript".into(), script.clone()];
@@ -777,9 +793,22 @@ fn install_run() -> Tool {
                 &environment(args),
             )
             .map_err(ToolError::failed)?;
+            let mut summary = format!("installation started as {}", job.id);
+            if let Some(version) = &check.local {
+                summary.push_str(&format!(" with installer client {version}"));
+            }
+            if let Some(warning) = check.warning() {
+                summary.push_str(&format!("\n\nnote: {warning}"));
+            }
             Ok(ToolResult::structured(
-                format!("installation started as {}", job.id),
-                json!({ "job_id": job.id, "job_dir": job.dir, "log": job.log, "command": job.command }),
+                summary,
+                json!({
+                    "job_id": job.id,
+                    "job_dir": job.dir,
+                    "log": job.log,
+                    "command": job.command,
+                    "installer": check,
+                }),
             ))
         }),
     )
@@ -795,13 +824,6 @@ fn job_status() -> Tool {
         json!({
             "type": "object",
             "required": ["job_id"],
-            let mut summary = format!("installation started as {}", job.id);
-            if let Some(version) = &check.local {
-                summary.push_str(&format!(" with installer client {version}"));
-            }
-            if let Some(warning) = check.warning() {
-                summary.push_str(&format!("\n\nnote: {warning}"));
-            }
             "properties": {
                 "job_id": { "type": "string" },
                 "lines": { "type": "integer", "description": "Log lines to return (default 40)." }

@@ -25,10 +25,19 @@ pub fn server() -> Server {
             "Drives IBM webMethods Update Manager without its console wizard. `fixes_installed` \
              reads what is patched and needs no credentials. `fix_script_generate` writes an \
              unattended script — one step or a batch — and `fix_run` executes it, returning a \
-             job id to poll with `job_status`. Credentials are referenced from the environment \
-             ($WM_EMPOWER_USER / $WM_EMPOWER_KEY) and never written to disk. When something \
-             fails, `sum_result` decodes the base64 fields of bin/result.json and \
-             `sum_locks` clears the stale lock that makes Update Manager exit 211 in silence.",
+             job id to poll with `job_status`, which returns a failed run's cause, remedy and \
+             log tail in the text. When something fails, `sum_result` decodes the base64 \
+             fields of bin/result.json and `sum_locks` clears the stale lock that makes Update \
+             Manager exit 211 in silence.\n\n\
+             Credentials come from $WM_EMPOWER_USER and $WM_EMPOWER_KEY, or from the \
+             encrypted store the installer server's `credential_set` fills; the environment \
+             wins where both have a value. Either way the value is referenced by variable \
+             name and never written into a script, a wrapper or a log.\n\n\
+             An installation registered with the installer server's `install_register` can be \
+             named with `install` wherever `install_dir` or `sum_home` is taken — the record \
+             carries the Update Manager home that patches it. This server and the installer \
+             server agree on where jobs and caches live, so a job id from either is pollable \
+             by either.",
         )
         .tool(crate::native::fixes_available())
         .tool(crate::native::fix_apply())
@@ -46,8 +55,13 @@ pub fn server() -> Server {
 }
 
 fn sum_home(args: &Value) -> Result<PathBuf, ToolError> {
+    // A registered installation records the Update Manager home that patches
+    // it, which is the one fact about SUM that is per-installation rather than
+    // per-machine.
+    let from_registry = opt_str(args, "install")
+        .and_then(|name| wm_core::registry::get(&name).ok())
+        .and_then(|i| i.sum_home);
     let path = opt_str(args, "sum_home")
-        .or_else(|| std::env::var("WM_SUM_HOME").ok())
         .map(PathBuf::from)
         .or(from_registry)
         .or_else(|| std::env::var("WM_SUM_HOME").map(PathBuf::from).ok())
@@ -64,12 +78,6 @@ fn sum_home(args: &Value) -> Result<PathBuf, ToolError> {
     }
     Ok(path)
 }
-    // A registered installation records the Update Manager home that patches
-    // it, which is the one fact about SUM that is per-installation rather than
-    // per-machine.
-    let from_registry = opt_str(args, "install")
-        .and_then(|name| wm_core::registry::get(&name).ok())
-        .and_then(|i| i.sum_home);
 
 fn install_dir(args: &Value) -> Result<PathBuf, ToolError> {
     if let Some(name) = opt_str(args, "install") {
@@ -107,14 +115,10 @@ fn scratch_script(script: &FixScript, label: &str) -> Result<PathBuf, ToolError>
     Ok(path)
 }
 
-fn jobs_dir() -> PathBuf {
-    std::env::var("WM_JOBS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            Path::new(&home).join(".wm-mcp").join("jobs")
-        })
-}
+// Both servers ask `wm_core::config` where things live. This one used to work
+// it out itself and ignored WM_STATE_DIR, so a job started here landed
+// somewhere the other server's job_status did not look.
+use wm_core::config::jobs_dir;
 
 fn fixes_installed() -> Tool {
     Tool::new(
@@ -125,6 +129,7 @@ fn fixes_installed() -> Tool {
         json!({
             "type": "object",
             "properties": {
+                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
                 "sum_home": { "type": "string" },
                 "install_dir": { "type": "string", "description": "Installation to inspect; defaults to $WM_HOME." },
                 "timeout_seconds": { "type": "integer", "description": "Give up after this long (default 600). Update Manager checks for a self-update before answering, so allow minutes." }
@@ -132,7 +137,6 @@ fn fixes_installed() -> Tool {
         }),
         Box::new(|args| {
             let sum = sum_home(args)?;
-                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
             let target = install_dir(args)?;
             let locks = sum::stale_locks(&sum);
             if !locks.is_empty() {
@@ -241,6 +245,7 @@ fn fix_script_generate() -> Tool {
                              "create_image", "view_installed", "view_available",
                              "create_inventory", "uninstall", "revert", "delete_backup"]
                 },
+                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
                 "install_dir": { "type": "string" },
                 "fixes": { "type": "array", "items": { "type": "string" }, "description": "Fix names; empty means all applicable." },
                 "image_file": { "type": "string" },
@@ -248,7 +253,6 @@ fn fix_script_generate() -> Tool {
                 "empower_user": { "type": "string", "description": "Defaults to $WM_EMPOWER_USER." },
                 "sum_home": { "type": "string" },
                 "write_to": { "type": "string", "description": "Also write the script here." }
-                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
             }
         }),
         Box::new(|args| {
@@ -286,6 +290,7 @@ fn fix_run() -> Tool {
             "required": ["script"],
             "properties": {
                 "script": { "type": "string", "description": "Path to the script." },
+                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
                 "sum_home": { "type": "string" },
                 "with_credentials": { "type": "boolean", "description": "Pass IBM credentials (default true; set false for offline actions)." }
             }
@@ -293,7 +298,6 @@ fn fix_run() -> Tool {
         Box::new(|args| {
             let sum = sum_home(args)?;
             let script = req_str(args, "script")?;
-                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
             if !Path::new(&script).is_file() {
                 return Err(ToolError::invalid(format!("no script at {script}")));
             }
@@ -361,6 +365,7 @@ fn sum_locks() -> Tool {
         json!({
             "type": "object",
             "properties": {
+                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
                 "sum_home": { "type": "string" },
                 "remove": { "type": "boolean", "description": "Delete them (default false). Make sure no Update Manager process is running." }
             }
@@ -368,7 +373,6 @@ fn sum_locks() -> Tool {
         Box::new(|args| {
             let sum = sum_home(args)?;
             let locks = sum::stale_locks(&sum);
-                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
             let remove = flag(args, "remove", false);
             let mut removed = Vec::new();
             if remove {
