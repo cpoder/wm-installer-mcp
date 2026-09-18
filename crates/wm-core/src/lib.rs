@@ -14,6 +14,7 @@
 //! base products — is decided here, before a process is started.
 
 pub mod catalog;
+pub mod config;
 pub mod database;
 pub mod deps;
 pub mod diag;
@@ -29,6 +30,7 @@ pub mod resolve;
 pub mod runner;
 pub mod script;
 pub mod sdc;
+pub mod secrets;
 pub mod sum;
 pub mod tree;
 

@@ -274,13 +274,28 @@ fn fix_run() -> Tool {
 
             let mut env = Environment::default();
             let credentials = if flag(args, "with_credentials", true) {
-                let user = std::env::var("WM_EMPOWER_USER").map_err(|_| {
-                    ToolError::invalid(
-                        "WM_EMPOWER_USER is not set; set it or pass with_credentials=false",
-                    )
-                })?;
-                if std::env::var(KEY_VAR).is_err() {
-                    return Err(ToolError::invalid(format!("{KEY_VAR} is not set")));
+                // Whichever source the value comes from, the command line gets
+                // `$WM_EMPOWER_KEY` and never the value: the wrapper the job
+                // runs from stays on disk for the life of the job.
+                env.secret_env = wm_core::secrets::job_environment();
+                let user = std::env::var("WM_EMPOWER_USER")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .or_else(|| wm_core::secrets::lookup(wm_core::secrets::EMPOWER_USER))
+                    .ok_or_else(|| {
+                        ToolError::invalid(
+                            "no IBM account: $WM_EMPOWER_USER is not set and \"empower.user\" \
+                             is not in the credential store. Set one, or pass \
+                             with_credentials=false.",
+                        )
+                    })?;
+                let have_key = std::env::var_os(KEY_VAR).is_some()
+                    || env.secret_env.iter().any(|(name, _)| name == KEY_VAR);
+                if !have_key {
+                    return Err(ToolError::invalid(format!(
+                        "no entitlement key: ${KEY_VAR} is not set and \"empower.key\" is not \
+                         in the credential store"
+                    )));
                 }
                 env.passthrough.push(KEY_VAR.to_string());
                 Some((user, format!("${KEY_VAR}")))

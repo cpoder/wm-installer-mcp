@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+aes-gcm = { version = "0.11", features = ["zeroize"] }
 base64 = { workspace = true }
 getrandom = "0.4.3"
 hmac = "0.13.0"

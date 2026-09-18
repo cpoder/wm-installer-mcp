@@ -53,6 +53,16 @@ pub struct Environment {
     /// emits `"$NAME"` in the wrapper, which the shell expands from the
     /// environment this process already has.
     pub passthrough: Vec<String>,
+    /// Variables handed to the spawned process rather than written into the
+    /// wrapper, and referenced by name like [`Environment::passthrough`].
+    ///
+    /// [`Environment::extra`] becomes `export NAME=value` in a file that stays
+    /// on disk for the life of the job, which is the right place for a
+    /// `$NAME$` placeholder and the wrong place for a credential. A secret
+    /// that this process holds but has not got in its own environment — one
+    /// read out of the encrypted store — goes here: the child gets it through
+    /// its environment, the wrapper holds only the name.
+    pub secret_env: Vec<(String, String)>,
 }
 
 impl Environment {
@@ -225,6 +235,11 @@ pub fn spawn(
     let exit_file = dir.join("exit_code");
     let wrapper = dir.join("run.sh");
 
+    // A secret's name is referenceable exactly like a passthrough variable; the
+    // only difference is where the value comes from.
+    let mut referenceable = env.passthrough.clone();
+    referenceable.extend(env.secret_env.iter().map(|(name, _)| name.clone()));
+
     let mut script = String::from("#!/bin/sh\n");
     for (key, value) in env.vars() {
         script.push_str(&format!("export {key}={}\n", shell_quote(&value)));
@@ -241,7 +256,7 @@ pub fn spawn(
         "{} {} {} >> {} 2>&1\necho $? > {}\n",
         shell_quote(&program.display().to_string()),
         args.iter()
-            .map(|a| quote_arg(a, &env.passthrough))
+            .map(|a| quote_arg(a, &referenceable))
             .collect::<Vec<_>>()
             .join(" "),
         redirect,
@@ -263,6 +278,11 @@ pub fn spawn(
     };
     Command::new(launcher)
         .args(&launch_args)
+        .envs(
+            env.secret_env
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -515,6 +535,7 @@ pub struct Console {
     pub max_advances: usize,
     /// What to send at each pause. An empty line accepts the displayed default,
     /// which at Update Manager's navigation prompt is `N` for Next.
+            secret_env: Vec::new(),
     pub answer: String,
 }
 
@@ -558,6 +579,52 @@ pub fn run_console(
     use std::os::unix::process::CommandExt as _;
 
     let (master, slave) = open_pty()?;
+    #[test]
+    fn a_stored_secret_reaches_the_job_without_touching_the_wrapper() {
+        // The whole reason `secret_env` is not just another `extra`: `extra`
+        // becomes an `export NAME=value` line in a file that stays on disk for
+        // the life of the job, and an entitlement key is a bearer token.
+        let base = std::env::temp_dir().join(format!("wm-core-stored-{}", unique_suffix()));
+        let env = Environment {
+            secret_env: vec![("WM_TEST_STORED".to_string(), "a-bearer-token".to_string())],
+            ..Environment::default()
+        };
+        let job = spawn(
+            &base,
+            "stored",
+            Path::new("/bin/echo"),
+            &["$WM_TEST_STORED".into()],
+            &env,
+        )
+        .expect("spawn");
+        let wrapper = fs::read_to_string(job.dir.join("run.sh")).expect("wrapper");
+        assert!(
+            wrapper.contains("\"$WM_TEST_STORED\""),
+            "a secret_env name is referenceable like a passthrough one: {wrapper}"
+        );
+        assert!(
+            !wrapper.contains("a-bearer-token"),
+            "the value reached the wrapper: {wrapper}"
+        );
+        assert!(
+            !wrapper.contains("WM_TEST_STORED="),
+            "no assignment written: {wrapper}"
+        );
+        // And it really does arrive: the job echoes what the shell expanded.
+        for _ in 0..50 {
+            if matches!(job_state(&job.dir), JobState::Finished { .. }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let out = fs::read_to_string(&job.log).unwrap_or_default();
+        assert!(
+            out.contains("a-bearer-token"),
+            "job did not receive it: {out:?}"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
     // Three identical messages here were indistinguishable in a log; name the
     // descriptor each clone was for.
     let clone = |which: &str| {

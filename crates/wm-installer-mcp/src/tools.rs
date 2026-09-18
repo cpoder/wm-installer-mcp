@@ -299,6 +299,11 @@ fn plan_resolve() -> Tool {
                 summary.push_str(&format!("; {} caveat(s)", resolution.caveats.len()));
             }
             Ok(ToolResult::structured(
+        // A script's $WM_EMPOWER_KEY$ placeholder resolves from the job's
+        // environment. When the key lives in the credential store rather than
+        // this process's environment, this is what puts it there — without it
+        // ever reaching the wrapper the job runs from.
+        secret_env: wm_core::secrets::job_environment(),
                 summary,
                 json!({
                     // A path kept verbatim is an advisory, not an incomplete

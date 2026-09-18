@@ -9,10 +9,22 @@ use wm_core::fixes::{self, Inventory};
 use wm_core::sdc::{self, Session};
 
 fn credentials() -> Result<(String, String), ToolError> {
-    let user = std::env::var("WM_EMPOWER_USER")
-        .map_err(|_| ToolError::invalid("WM_EMPOWER_USER is not set"))?;
-    let key = std::env::var("WM_EMPOWER_KEY")
-        .map_err(|_| ToolError::invalid("WM_EMPOWER_KEY is not set"))?;
+    // Environment first, then the encrypted store: an export is how a single
+    // run overrides the machine's stored account without touching it.
+    let from = |var: &str, stored: &str| {
+        std::env::var(var)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| wm_core::secrets::lookup(stored))
+            .ok_or_else(|| {
+                ToolError::invalid(format!(
+                    "no IBM entitlement credentials: ${var} is not set and {stored:?} is not \
+                     in the credential store. The installer server's credential_set fills it."
+                ))
+            })
+    };
+    let user = from("WM_EMPOWER_USER", wm_core::secrets::EMPOWER_USER)?;
+    let key = from("WM_EMPOWER_KEY", wm_core::secrets::EMPOWER_KEY)?;
     Ok((user, key))
 }
 
@@ -60,6 +72,7 @@ pub fn fixes_available() -> Tool {
         json!({
             "type": "object",
             "properties": {
+                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
                 "install_dir": { "type": "string", "description": "Installation to check; defaults to $WM_HOME." },
                 "release": { "type": "string", "description": "Release, e.g. 12.1. Inferred from the installation when omitted." },
                 "platform": { "type": "string", "description": "LNXAMD64 by default." },
@@ -133,6 +146,7 @@ pub fn fixes_inventory() -> Tool {
         json!({
             "type": "object",
             "properties": {
+                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
                 "install_dir": { "type": "string" },
                 "platform": { "type": "string" }
             }
@@ -167,6 +181,7 @@ pub fn fixes_download() -> Tool {
             "required": ["output_dir"],
             "properties": {
                 "output_dir": { "type": "string", "description": "Where to write the fixes." },
+                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
                 "install_dir": { "type": "string" },
                 "release": { "type": "string" },
                 "platform": { "type": "string" },
@@ -313,6 +328,7 @@ pub fn fix_apply() -> Tool {
             "required": ["path"],
             "properties": {
                 "path": { "type": "string", "description": "Path to the fix archive." },
+                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
                 "install_dir": { "type": "string", "description": "Installation to patch; defaults to $WM_HOME." },
                 "apply": { "type": "boolean", "description": "Set true to write; otherwise a dry run." }
             }

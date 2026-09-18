@@ -9,37 +9,34 @@ use wm_core::sdc::{self, Session};
 use wm_core::tree::ProductTree;
 use wm_core::{deps, install, profile, runner};
 
-/// Where fetched product trees and artifacts are kept between calls.
-fn state_dir() -> PathBuf {
-    std::env::var("WM_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            Path::new(&home).join(".wm-mcp")
-        })
-}
+// Every path this server uses comes from `wm_core::config`, which is also what
+// the Update Manager server reads. Two definitions of where jobs live means a
+// job written where the status call does not look.
+pub use wm_core::config::jobs_dir;
 
-/// Where jobs live. The single definition: a job written somewhere the status
-/// call does not look is a job that cannot be followed, and there were two of
-/// these disagreeing whenever WM_STATE_DIR was set.
-pub fn jobs_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("WM_JOBS_DIR") {
-        return PathBuf::from(dir);
-    }
-    jobs_dir_inner()
-}
-
-fn jobs_dir_inner() -> PathBuf {
-    std::env::var("WM_JOBS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| state_dir().join("jobs"))
+/// One credential, from the environment first and then the encrypted store.
+///
+/// The environment keeps winning because that is how a CI run injects a key for
+/// one invocation without touching the machine's store, and because an operator
+/// who exports a variable to override the store expects the override to work.
+fn credential(var: &str, stored: &str) -> Option<String> {
+    std::env::var(var)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| wm_core::secrets::lookup(stored))
 }
 
 fn credentials() -> Result<(String, String), ToolError> {
-    let user = std::env::var("WM_EMPOWER_USER")
-        .map_err(|_| ToolError::invalid("WM_EMPOWER_USER is not set"))?;
-    let key = std::env::var("WM_EMPOWER_KEY")
-        .map_err(|_| ToolError::invalid("WM_EMPOWER_KEY is not set"))?;
+    let missing = |var: &str, stored: &str| {
+        ToolError::invalid(format!(
+            "no IBM entitlement credentials: ${var} is not set and {stored:?} is not in the \
+             credential store. Set it with credential_set, or export ${var}."
+        ))
+    };
+    let user = credential("WM_EMPOWER_USER", wm_core::secrets::EMPOWER_USER)
+        .ok_or_else(|| missing("WM_EMPOWER_USER", wm_core::secrets::EMPOWER_USER))?;
+    let key = credential("WM_EMPOWER_KEY", wm_core::secrets::EMPOWER_KEY)
+        .ok_or_else(|| missing("WM_EMPOWER_KEY", wm_core::secrets::EMPOWER_KEY))?;
     Ok((user, key))
 }
 
@@ -56,9 +53,25 @@ fn login(args: &Value) -> Result<Session, ToolError> {
 
 /// Cache path for one release/platform tree.
 fn tree_path(sandbox: &str, platform: &str) -> PathBuf {
-    state_dir()
-        .join("catalog")
-        .join(format!("{sandbox}-{platform}.tree"))
+    wm_core::config::catalog_dir().join(format!("{sandbox}-{platform}.tree"))
+}
+
+/// A cached tree, when the release was named the way the cache is keyed.
+///
+/// The cache file is `<sandbox>-<platform>.tree`, so a caller who says
+/// `webM121` — which is what the file is called, and the first thing anyone
+/// reads off the disk — is naming the cache entry directly. A release number
+/// like `12.1` still needs the entitlement list to map it to a sandbox, because
+/// nothing local relates the two.
+fn cached_tree(release: &str, platform: &str) -> Option<(ProductTree, String)> {
+    let sandbox = release.trim();
+    let path = tree_path(sandbox, platform);
+    if !path.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let tree = ProductTree::parse(&text).ok()?;
+    Some((tree, sandbox.to_string()))
 }
 
 /// Load a cached tree, or fetch and cache it.
@@ -357,8 +370,17 @@ pub fn native_install() -> Tool {
                 .map_err(|e| ToolError::failed(format!("cannot locate this executable: {e}")))?;
             let env = runner::Environment {
                 // Credentials stay in this process's environment and are
-                // inherited by the job; nothing is written to the wrapper.
-                passthrough: vec!["WM_EMPOWER_USER".into(), "WM_EMPOWER_KEY".into()],
+                // inherited by the job; nothing is written to the wrapper. The
+                // passphrase goes too, so a job can reopen the credential store.
+                passthrough: vec![
+                    "WM_EMPOWER_USER".into(),
+                    "WM_EMPOWER_KEY".into(),
+                    wm_core::secrets::PASSPHRASE_VAR.into(),
+                    "WM_CONFIG_DIR".into(),
+                ],
+                // The job authenticates on its own behalf, so a key held only
+                // in the store has to reach its environment.
+                secret_env: wm_core::secrets::job_environment(),
                 ..runner::Environment::default()
             };
             let job = runner::spawn(
@@ -691,7 +713,7 @@ pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
         install_dir.display()
     );
     std::fs::create_dir_all(&install_dir).map_err(|e| e.to_string())?;
-    let cache = state_dir().join("artifacts").join(&sandbox);
+    let cache = wm_core::config::artifacts_dir().join(&sandbox);
 
     let mut done = 0usize;
     let mut bytes = 0u64;
