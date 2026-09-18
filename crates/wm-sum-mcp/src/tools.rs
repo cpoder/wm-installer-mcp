@@ -45,6 +45,7 @@ pub fn server() -> Server {
         .tool(crate::native::fixes_download())
         .tool(crate::native::fixes_inventory())
         .tool(crate::native::fixes_parse_metadata())
+        .tool(crate::native::fixes_plan())
         .tool(fixes_installed())
         .tool(fix_script_generate())
         .tool(fix_run())

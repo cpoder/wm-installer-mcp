@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mcp_rt::args::{flag, opt_str, req_str};
+use mcp_rt::args::{flag, opt_str, req_str, str_list};
 use mcp_rt::{Tool, ToolError, ToolResult};
 use serde_json::{json, Value};
 use wm_core::fixes::{self, Inventory};
@@ -480,6 +480,112 @@ pub fn fix_apply() -> Tool {
                     "fix_version": fix.version,
                     "result": applied,
                     "profiles_to_stop": fix.profiles(),
+                }),
+            ))
+        }),
+    )
+}
+
+/// Order a set of downloaded fixes.
+pub fn fixes_plan() -> Tool {
+    Tool::new(
+        "fixes_plan",
+        "Put downloaded fix archives in the order their manifests require: Require-Fix (must \
+         be installed first) and Install-After (goes first when the two are installed \
+         together). Reports a fix the set needs that is neither in it nor recorded as \
+         installed by Update Manager, a member too old for what another one needs, a cycle, \
+         and a fix selected at two versions. Reads the archives and the registry, writes \
+         nothing. Then apply them in that order with fix_apply, one at a time.",
+        json!({
+            "type": "object",
+            "required": ["paths"],
+            "properties": {
+                "paths": { "type": "array", "items": { "type": "string" }, "description": "Fix archives, as fixes_download wrote them." },
+                "install": { "type": "string", "description": "A registered installation, whose Update Manager registry answers what is already installed." },
+                "install_dir": { "type": "string", "description": "Installation whose registry to consult; defaults to $WM_HOME." }
+            }
+        }),
+        Box::new(|args| {
+            let paths = str_list(args, "paths");
+            if paths.is_empty() {
+                return Err(ToolError::invalid("paths is empty"));
+            }
+            let fixes: Vec<wm_core::fix::Fix> = paths
+                .iter()
+                .map(|p| wm_core::fix::Fix::read(Path::new(p)))
+                .collect::<Result<_, _>>()
+                .map_err(ToolError::failed)?;
+            let ordered = wm_core::fix::order(&fixes);
+
+            // A requirement the set does not meet may be met by the
+            // installation, if Update Manager recorded it there.
+            let registry = match install_dir(args) {
+                Ok(dir) => wm_core::fixregistry::read(&dir).map_err(ToolError::failed)?,
+                Err(_) => None,
+            };
+            let unmet: Vec<String> = ordered
+                .required_elsewhere
+                .iter()
+                .filter(|req| {
+                    let recorded = registry.as_ref().and_then(|r| r.get(&req.name));
+                    !recorded.is_some_and(|rec| {
+                        req.version.as_deref().is_none_or(|minimum| {
+                            wm_core::fix::osgi_version_cmp(&rec.version, minimum)
+                                != std::cmp::Ordering::Less
+                        })
+                    })
+                })
+                .map(|req| match &req.version {
+                    Some(v) => format!("{} >= {v}", req.name),
+                    None => req.name.clone(),
+                })
+                .collect();
+
+            let mut summary = format!("{} fix(es), in order:", ordered.order.len());
+            for (n, &index) in ordered.order.iter().enumerate() {
+                let fix = &fixes[index];
+                summary.push_str(&format!(
+                    "\n  {}. {} {}  ({})",
+                    n + 1,
+                    fix.name.as_deref().unwrap_or("?"),
+                    fix.version.as_deref().unwrap_or("?"),
+                    paths[index]
+                ));
+            }
+            if !ordered.problems.is_empty() {
+                summary.push_str(&format!(
+                    "\n\nproblems:\n{}",
+                    ordered
+                        .problems
+                        .iter()
+                        .map(|p| format!("  - {p}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+            if !unmet.is_empty() {
+                summary.push_str(&format!(
+                    "\n\nrequired, and neither in this set nor recorded as installed by Update \
+                     Manager{}: {}",
+                    if registry.is_none() {
+                        " (no registry to consult: name the installation)"
+                    } else {
+                        " (a fix applied natively is not recorded either)"
+                    },
+                    unmet.join(", ")
+                ));
+            }
+            Ok(ToolResult::structured(
+                summary,
+                json!({
+                    "order": ordered.order.iter().map(|&i| json!({
+                        "path": paths[i],
+                        "name": fixes[i].name,
+                        "version": fixes[i].version,
+                    })).collect::<Vec<_>>(),
+                    "problems": ordered.problems,
+                    "required_elsewhere": ordered.required_elsewhere,
+                    "unmet": unmet,
                 }),
             ))
         }),

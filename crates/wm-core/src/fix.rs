@@ -301,6 +301,111 @@ impl Fix {
     }
 }
 
+/// The order a set of fixes must be applied in, from their manifests.
+#[derive(Debug, Clone, Serialize)]
+pub struct Ordered {
+    /// Indices into the input, in application order.
+    pub order: Vec<usize>,
+    /// Fixes named by `Require-Fix` that are in neither the set nor — the
+    /// caller's job to check — the installation.
+    pub required_elsewhere: Vec<Requirement>,
+    /// What stops the set from being applied as given.
+    pub problems: Vec<String>,
+}
+
+/// Order `fixes` so that every `Install-After` and `Require-Fix` naming a
+/// member of the set is satisfied before the fix that states it.
+///
+/// `Require-Fix` says a fix must be installed first, full stop; `Install-After`
+/// says it goes first when the two are installed together. Within one batch
+/// both mean the same edge. A cycle, or the same fix selected at two versions,
+/// is a problem rather than an order.
+pub fn order(fixes: &[Fix]) -> Ordered {
+    use std::collections::BTreeMap;
+    let mut ordered = Ordered {
+        order: Vec::new(),
+        required_elsewhere: Vec::new(),
+        problems: Vec::new(),
+    };
+    let mut by_name: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, fix) in fixes.iter().enumerate() {
+        let Some(name) = fix.name.as_deref() else {
+            ordered.problems.push(format!(
+                "{} has no Fix-Name in its manifest",
+                fix.path.display()
+            ));
+            continue;
+        };
+        if let Some(first) = by_name.insert(name, index) {
+            ordered.problems.push(format!(
+                "{name} is selected twice ({} and {}); keep the newer one",
+                fixes[first].version.as_deref().unwrap_or("unknown version"),
+                fix.version.as_deref().unwrap_or("unknown version")
+            ));
+        }
+    }
+    if !ordered.problems.is_empty() {
+        return ordered;
+    }
+
+    // Edges: predecessor -> this fix, for every requirement met inside the set.
+    let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); fixes.len()];
+    for (index, fix) in fixes.iter().enumerate() {
+        for requirement in fix.requires_fixes.iter().chain(fix.install_after.iter()) {
+            match by_name.get(requirement.name.as_str()) {
+                Some(&before) if before != index => {
+                    if let (Some(minimum), Some(have)) =
+                        (&requirement.version, &fixes[before].version)
+                    {
+                        if osgi_version_cmp(have, minimum) == Ordering::Less {
+                            ordered.problems.push(format!(
+                                "{} needs {} >= {minimum}, and the set carries {have}",
+                                fix.name.as_deref().unwrap_or("?"),
+                                requirement.name
+                            ));
+                        }
+                    }
+                    predecessors[index].push(before);
+                }
+                Some(_) => {}
+                None => {
+                    if fix.requires_fixes.contains(requirement)
+                        && !ordered.required_elsewhere.contains(requirement)
+                    {
+                        ordered.required_elsewhere.push(requirement.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Kahn's algorithm, taking the lowest-indexed ready fix each time so the
+    // result is stable for a given input.
+    let mut placed = vec![false; fixes.len()];
+    while ordered.order.len() < fixes.len() {
+        let next =
+            (0..fixes.len()).find(|&i| !placed[i] && predecessors[i].iter().all(|&p| placed[p]));
+        match next {
+            Some(i) => {
+                placed[i] = true;
+                ordered.order.push(i);
+            }
+            None => {
+                let stuck: Vec<&str> = (0..fixes.len())
+                    .filter(|&i| !placed[i])
+                    .filter_map(|i| fixes[i].name.as_deref())
+                    .collect();
+                ordered.problems.push(format!(
+                    "these fixes require each other in a cycle: {}",
+                    stuck.join(", ")
+                ));
+                break;
+            }
+        }
+    }
+    ordered
+}
+
 /// How to apply a fix.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Options {
@@ -1856,6 +1961,120 @@ mod tests {
             "{:?}",
             applied.warnings
         );
+    }
+
+    /// A fix with only what ordering looks at.
+    fn bare(name: &str, version: &str, requires: &[&str], after: &[&str]) -> Fix {
+        Fix {
+            path: PathBuf::from(format!("{name}_{version}")),
+            name: Some(name.into()),
+            display_name: None,
+            group: None,
+            version: Some(version.into()),
+            empower_id: None,
+            requires_sum_build: None,
+            require_product: None,
+            requires_fixes: requires.iter().map(|r| Requirement::parse_one(r)).collect(),
+            install_after: after.iter().map(|r| Requirement::parse_one(r)).collect(),
+            p2_repositories: Vec::new(),
+            phases: Vec::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fixes_are_ordered_by_what_they_require_and_follow() {
+        // The four real 12.1 fixes: SPM requires CCShared, CCShared goes after
+        // SUMApi and TPS.SharedBundles >= 0002 (and two OSGI fixes not here).
+        let fixes = vec![
+            bare(
+                "wMFix.SPM",
+                "12.1.0.0001-0556",
+                &["wMFix.CCShared;version=12.1.0.0001"],
+                &[],
+            ),
+            bare(
+                "wMFix.CCShared",
+                "12.1.0.0001-0556",
+                &[],
+                &[
+                    "wMFix.OSGI.Migration;version=12.1.0.0002",
+                    "wMFix.OSGI.Platform;version=12.1.0.0003",
+                    "wMFix.SUMApi;version=12.1.0.0001",
+                    "wMFix.TPS.SharedBundles;version=12.1.0.0002",
+                ],
+            ),
+            bare("wMFix.SUMApi", "12.1.0.0001-0468", &[], &[]),
+            bare("wMFix.TPS.SharedBundles", "12.1.0.0003-0779", &[], &[]),
+        ];
+        let ordered = order(&fixes);
+        assert!(ordered.problems.is_empty(), "{:?}", ordered.problems);
+        let names: Vec<&str> = ordered
+            .order
+            .iter()
+            .map(|&i| fixes[i].name.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "wMFix.SUMApi",
+                "wMFix.TPS.SharedBundles",
+                "wMFix.CCShared",
+                "wMFix.SPM"
+            ]
+        );
+        // Install-After on a fix outside the set is not a requirement.
+        assert!(
+            ordered.required_elsewhere.is_empty(),
+            "{:?}",
+            ordered.required_elsewhere
+        );
+    }
+
+    #[test]
+    fn a_requirement_outside_the_set_is_reported_for_the_installation_to_answer() {
+        let fixes = vec![bare(
+            "wMFix.SPM",
+            "12.1.0.0001-0556",
+            &["wMFix.CCShared;version=12.1.0.0001"],
+            &[],
+        )];
+        let ordered = order(&fixes);
+        assert_eq!(ordered.order, vec![0]);
+        assert_eq!(ordered.required_elsewhere.len(), 1);
+        assert_eq!(ordered.required_elsewhere[0].name, "wMFix.CCShared");
+    }
+
+    #[test]
+    fn a_too_old_member_a_cycle_and_a_duplicate_are_problems() {
+        let old = vec![
+            bare(
+                "wMFix.CCShared",
+                "12.1.0.0001-0556",
+                &[],
+                &["wMFix.TPS.SharedBundles;version=12.1.0.0002"],
+            ),
+            bare("wMFix.TPS.SharedBundles", "12.1.0.0001-0731", &[], &[]),
+        ];
+        assert!(order(&old)
+            .problems
+            .iter()
+            .any(|p| p.contains(">= 12.1.0.0002")));
+
+        let cycle = vec![
+            bare("wMFix.A", "1", &["wMFix.B"], &[]),
+            bare("wMFix.B", "1", &["wMFix.A"], &[]),
+        ];
+        assert!(order(&cycle).problems.iter().any(|p| p.contains("cycle")));
+
+        let twice = vec![
+            bare("wMFix.A", "12.1.0.0001-0001", &[], &[]),
+            bare("wMFix.A", "12.1.0.0002-0001", &[], &[]),
+        ];
+        assert!(order(&twice)
+            .problems
+            .iter()
+            .any(|p| p.contains("selected twice")));
     }
 
     #[test]

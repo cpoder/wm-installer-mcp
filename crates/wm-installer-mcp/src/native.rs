@@ -1168,7 +1168,7 @@ pub fn instance_create() -> Tool {
                 "jmx_port": { "type": "integer", "description": "The script defaults to 8075." },
                 "bind_address": { "type": "string", "description": "Default bind address for the ports." },
                 "admin_password": { "type": "string", "description": "Administrator password; the script reuses the install-time one when omitted." },
-                "license_file": { "type": "string", "description": "Path to an Integration Server licence key file." },
+                "license_file": { "type": "string", "description": "Path to an Integration Server licence key file. is_instance.sh 12.1 only checks that the file exists: the copy into the instance is commented out in is_instance.xml, and a 12.1 instance runs without one. Passing it changes nothing on disk." },
                 "packages": { "type": "array", "items": { "type": "string" }, "description": "Non-core packages to include." },
                 "db_type": { "type": "string", "description": "ORACLE, DB2, SQLSERVER, MYSQLCE, MYSQLEE or POSTGRESQL. Omitted, the instance uses the embedded database." },
                 "db_alias": { "type": "string" },
@@ -1272,12 +1272,42 @@ pub fn instance_create() -> Tool {
                     options.bind_address.as_deref().unwrap_or("every interface"),
                     options.bind_address.is_some(),
                 );
+                if let Some(file) = &options.license_file {
+                    setting(
+                        &mut settings,
+                        "license_file",
+                        format!("{file} (is_instance.sh 12.1 checks that it exists and does nothing else with it)"),
+                        true,
+                    );
+                }
+                // What the product's own script does with a secret is not
+                // ours to change, but it is ours to say before it runs.
+                let mut notes = Vec::new();
+                if options.admin_password.is_some() || options.db_password.is_some() {
+                    notes.push(
+                        "is_instance.sh takes the password(s) on its command line: visible in \
+                         the process list for the seconds it runs, in three processes (the \
+                         script, Ant, and the instance manager it forks)"
+                            .to_string(),
+                    );
+                }
+                if options.db_type.is_some() {
+                    notes.push(
+                        "with a database, the script writes db.password in clear into \
+                         config/jdbc/properties/db.properties inside the instance"
+                            .to_string(),
+                    );
+                }
+                let mut summary = format!(
+                    "dry run: would create instance {name}. Put the settings below to the \
+                     user, confirm or amend them, then call again with apply=true."
+                );
+                for note in &notes {
+                    summary.push_str(&format!("\nnote: {note}"));
+                }
                 return Ok(ToolResult::structured(
-                    format!(
-                        "dry run: would create instance {name}. Put the settings below to the \
-                         user, confirm or amend them, then call again with apply=true."
-                    ),
-                    json!({ "command": invocation.display(), "settings": settings }),
+                    summary,
+                    json!({ "command": invocation.display(), "settings": settings, "notes": notes }),
                 ));
             }
             let started = std::time::Instant::now();
@@ -1814,11 +1844,18 @@ pub fn database_configure() -> Tool {
                 }));
             }
 
-            let summary = format!(
+            let mut summary = format!(
                 "{}: {} component(s) on {database}",
                 if dry_run { "dry run" } else { "configured" },
                 done.len()
             );
+            if dry_run {
+                summary.push_str(
+                    "\nnote: dbConfigurator.sh takes --password (and --adminPassword) on its \
+                     command line, visible in the process list while each component runs; the \
+                     commands above show them masked",
+                );
+            }
             Ok(ToolResult::structured(
                 summary,
                 json!({ "components": done }),
