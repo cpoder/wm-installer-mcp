@@ -294,7 +294,11 @@ pub fn fixes_download() -> Tool {
 pub fn fix_inspect() -> Tool {
     Tool::new(
         "fix_inspect",
-        "Read a downloaded fix archive and report its recipe: the manifest, the p2 repositories          it refreshes, the numbered install phases with their actions, and which actions this          engine cannot perform. A fix is a signed JAR rooted at the installation directory plus          META-INF/instructions.txt; nothing is written.",
+        "Read a downloaded fix archive and report its recipe: the manifest (name, version, the \
+         fixes it requires and the ones that must go before it), the p2 repositories it \
+         refreshes, the numbered install phases with their actions, and which actions this \
+         engine does not perform. A fix is a signed JAR rooted at the installation directory \
+         plus META-INF/instructions.txt; nothing is written.",
         json!({
             "type": "object",
             "required": ["path"],
@@ -305,13 +309,35 @@ pub fn fix_inspect() -> Tool {
             let fix = wm_core::fix::Fix::read(Path::new(&path)).map_err(ToolError::failed)?;
             let unsupported = fix.unsupported().len();
             let mut summary = format!(
-                "{}: {} entries, {} phase(s)",
-                fix.display_name.clone().or_else(|| fix.name.clone()).unwrap_or_else(|| path.clone()),
+                "{}{}: {} entries, {} phase(s)",
+                fix.display_name
+                    .clone()
+                    .or_else(|| fix.name.clone())
+                    .unwrap_or_else(|| path.clone()),
+                fix.version
+                    .as_ref()
+                    .map(|v| format!(" ({v})"))
+                    .unwrap_or_default(),
                 fix.entries.len(),
                 fix.phases.len()
             );
+            if !fix.requires_fixes.is_empty() {
+                summary.push_str(&format!(
+                    "; requires {}",
+                    fix.requires_fixes
+                        .iter()
+                        .map(|r| match &r.version {
+                            Some(v) => format!("{} >= {v}", r.name),
+                            None => r.name.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
             if unsupported > 0 {
-                summary.push_str(&format!("; {unsupported} action(s) need a p2 director"));
+                summary.push_str(&format!(
+                    "; {unsupported} action(s) this engine does not perform"
+                ));
             }
             Ok(ToolResult::structured(summary, json!({ "fix": fix })))
         }),
@@ -322,7 +348,17 @@ pub fn fix_inspect() -> Tool {
 pub fn fix_apply() -> Tool {
     Tool::new(
         "fix_apply",
-        "Apply a downloaded fix to an installation natively — extract, delete and OSGi cache          actions, no Update Manager. Defaults to a dry run, which is the right first call: a          fix expects its runtimes stopped, and this reports whether they look like they are          running. Actions that need a p2 director are listed as not performed rather than          silently skipped.",
+        "Apply a downloaded fix to an installation natively: refresh the p2 repositories it \
+         carries, run its extract, delete and OSGi-cache actions, and move each profile's \
+         bundle list to the builds it delivers — no Update Manager. Defaults to a dry run, \
+         which is the right first call: it reports the repository level before and after, \
+         every profile line that would move, and whether a profile the fix touches looks \
+         like it is running. It refuses a fix that is already applied or older than what \
+         the repository carries, and refuses to write under a running profile; force=true \
+         overrides both and still never moves a profile line to an older build. Actions of \
+         Update Manager's vocabulary this engine does not perform are listed as not \
+         performed rather than silently skipped. Not done: recording the fix where Update \
+         Manager looks (install/fix), so Update Manager still sees it as missing.",
         json!({
             "type": "object",
             "required": ["path"],
@@ -330,39 +366,116 @@ pub fn fix_apply() -> Tool {
                 "path": { "type": "string", "description": "Path to the fix archive." },
                 "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
                 "install_dir": { "type": "string", "description": "Installation to patch; defaults to $WM_HOME." },
-                "apply": { "type": "boolean", "description": "Set true to write; otherwise a dry run." }
+                "apply": { "type": "boolean", "description": "Set true to write; otherwise a dry run." },
+                "force": { "type": "boolean", "description": "Apply although the fix looks already applied or older than the repository, or although a profile it touches looks like it is running. Default false." }
             }
         }),
         Box::new(|args| {
             let path = req_str(args, "path")?;
             let target = install_dir(args)?;
             if !target.is_dir() {
-                return Err(ToolError::invalid(format!("no installation at {}", target.display())));
+                return Err(ToolError::invalid(format!(
+                    "no installation at {}",
+                    target.display()
+                )));
             }
             let fix = wm_core::fix::Fix::read(Path::new(&path)).map_err(ToolError::failed)?;
-            let dry_run = !flag(args, "apply", false);
-            let applied =
-                wm_core::fix::apply(&fix, &target, dry_run).map_err(ToolError::failed)?;
+            let options = wm_core::fix::Options {
+                dry_run: !flag(args, "apply", false),
+                force: flag(args, "force", false),
+            };
+            let applied = wm_core::fix::apply(&fix, &target, options).map_err(ToolError::failed)?;
 
-            let mut summary = format!(
-                "{}: {} file(s) {}, {} deleted, {} bundle(s) replaced in profiles, {} cache(s) cleared",
-                if dry_run { "dry run" } else { "applied" },
+            let count = |kind| {
+                applied
+                    .profile_updates
+                    .iter()
+                    .filter(|u| u.kind == kind)
+                    .count()
+            };
+            let mut summary = String::from(if applied.performed {
+                "applied"
+            } else if !applied.dry_run {
+                "NOT applied"
+            } else if applied.blocked.is_empty() {
+                "dry run"
+            } else {
+                "dry run, would be refused"
+            });
+            summary.push_str(&format!(
+                ": {} file(s) {}, {} deleted, {} bundle(s) replaced and {} refreshed in \
+                 profiles, {} cache(s) cleared",
                 applied.extracted.len(),
-                if dry_run { "would be written" } else { "written" },
+                if applied.performed {
+                    "written"
+                } else {
+                    "would be written"
+                },
                 applied.deleted.len(),
-                applied.profile_updates.len(),
+                count(wm_core::fix::UpdateKind::Replaced),
+                count(wm_core::fix::UpdateKind::Refreshed),
                 applied.caches_cleared.len()
-            );
+            ));
+            for level in &applied.repositories {
+                summary.push_str(&format!(
+                    "\n  {}: {} -> {}",
+                    level.path,
+                    level.installed.as_deref().unwrap_or("no features on disk"),
+                    level.delivered.as_deref().unwrap_or("unknown")
+                ));
+            }
+            if !applied.blocked.is_empty() {
+                summary.push_str(&format!(
+                    "\n\n{}:\n{}",
+                    if applied.performed {
+                        "applied despite"
+                    } else {
+                        "refused"
+                    },
+                    applied
+                        .blocked
+                        .iter()
+                        .map(|b| format!("  - {b}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+                if !applied.performed && !applied.dry_run {
+                    summary.push_str("\nPass force=true to apply anyway.");
+                }
+            }
             if !applied.not_performed.is_empty() {
-                summary.push_str(&format!("; {} action(s) not performed", applied.not_performed.len()));
+                summary.push_str(&format!(
+                    "\n\n{} action(s) not performed",
+                    applied.not_performed.len()
+                ));
             }
             if !applied.warnings.is_empty() {
-                summary.push_str(&format!("; {} warning(s)", applied.warnings.len()));
+                summary.push_str(&format!(
+                    "\n\nwarnings:\n{}",
+                    applied
+                        .warnings
+                        .iter()
+                        .map(|w| format!("  - {w}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+            if !applied.verification.is_empty() {
+                summary.push_str(&format!(
+                    "\n\nverification found problems:\n{}",
+                    applied
+                        .verification
+                        .iter()
+                        .map(|v| format!("  - {v}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
             }
             Ok(ToolResult::structured(
                 summary,
                 json!({
                     "fix": fix.name,
+                    "fix_version": fix.version,
                     "result": applied,
                     "profiles_to_stop": fix.profiles(),
                 }),
