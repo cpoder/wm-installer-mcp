@@ -366,6 +366,11 @@ to 58, eleven of them bringing MWS and OSGI along.
   rather than spending a minute discovering it. Getting a newer one is manual:
   the `.bin` is not in the product tree, and Passport Advantage and Fix Central
   authenticate an IBMid rather than an entitlement key.
+- **The key is visible in the process list while Update Manager runs.**
+  `UpdateManagerCMD.sh` takes it as `-empowerPass`, the only non-interactive
+  way it accepts one, and a JVM's arguments are readable in `/proc` by any
+  process of the same user for as long as it lives. The job's wrapper unsets
+  the variable before Update Manager starts, so that is the one place left.
 - **Developed and verified on Linux.** CI builds macOS and Windows binaries; the
   Update Manager path uses a Unix pseudo-terminal and is Unix-only.
 - **Unofficial.** Not an IBM product, no support. It talks to IBM services with

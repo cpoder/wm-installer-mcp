@@ -331,7 +331,7 @@ mod tests {
 <?profile version='1.0.0'?>\n\
 <profile id='self' timestamp='1784564816049'>\n\
   <properties size='2'>\n\
-    <property name='webm_install_dir' value='/home/cpo/wm12'/>\n\
+    <property name='webm_install_dir' value='/opt/webmethods'/>\n\
     <property name='regular' value='true'/>\n\
   </properties>\n\
   <units size='4'>\n\
@@ -381,7 +381,7 @@ mod tests {
         let (properties, fixes) = parse_profile(PROFILE);
         assert_eq!(
             properties.get("webm_install_dir").map(String::as_str),
-            Some("/home/cpo/wm12")
+            Some("/opt/webmethods")
         );
         // The product unit is not a fix; the diagnoser is a support patch.
         assert_eq!(fixes.len(), 3);

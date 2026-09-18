@@ -19,7 +19,7 @@ What a script does **not** remove is the terminal. Measured on 12.0.0.0008 with
 `action=View installed fixes` and `installDir` both supplied:
 
 * stdin closed — the wizard reaches `Product directory (full path):
-  [/home/cpo/wm12] ?`, having taken the value from the script, then hits EOF at
+  [/opt/webmethods] ?`, having taken the value from the script, then hits EOF at
   the navigation prompt and aborts: `Error Received: Terminating IBM webMethods
   Update Manager exit code:-1`, exit 255.
 * 40 newlines on a plain pipe — identical failure. Piped answers are ignored.

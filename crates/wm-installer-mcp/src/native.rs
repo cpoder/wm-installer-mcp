@@ -689,7 +689,7 @@ pub fn native_install() -> Tool {
             let jobs = jobs_dir();
             std::fs::create_dir_all(&jobs)
                 .map_err(|e| ToolError::failed(format!("cannot create {}: {e}", jobs.display())))?;
-            let spec_path = jobs.join(format!("install-spec-{}.json", std::process::id()));
+            let spec_path = spec_file(&jobs);
             std::fs::write(&spec_path, spec.to_string())
                 .map_err(|e| ToolError::failed(format!("cannot write the job spec: {e}")))?;
 
@@ -1399,10 +1399,56 @@ pub fn profile_replay() -> Tool {
     )
 }
 
+/// A spec file name no other call can collide with.
+///
+/// It used to be `install-spec-<pid>.json`: two calls from the same server in
+/// quick succession wrote the same file, and the first job could read the
+/// second call's selection. The job copies the spec into its own directory and
+/// removes this one once it has read it.
+fn spec_file(jobs: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    jobs.join(format!(
+        "install-spec-{}-{nanos}-{n}.json",
+        std::process::id()
+    ))
+}
+
 /// Perform the install described by `spec_path`. Entry point for the job process.
 pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
+    let job_dir = std::env::var("WM_JOB_DIR").map(PathBuf::from).ok();
+    run_install_job_in(spec_path, job_dir.as_deref())
+}
+
+/// The job, with its directory given rather than read from the environment.
+///
+/// Whatever happens, `progress.json` ends up finished. `--watch` returns only
+/// on that, and a job that failed used to leave it open, so the watcher redrew
+/// the same frame forever while `job_status` had long reported the failure.
+pub fn run_install_job_in(spec_path: &Path, job_dir: Option<&Path>) -> Result<(), String> {
+    let outcome = install_from_spec(spec_path, job_dir);
+    if let (Err(message), Some(dir)) = (&outcome, job_dir) {
+        let mut progress = wm_core::progress::Progress::read(dir)
+            .unwrap_or_else(|| wm_core::progress::Progress::new("failed", 0, 0));
+        progress.finish(false, &format!("install failed: {message}"), dir);
+    }
+    outcome
+}
+
+fn install_from_spec(spec_path: &Path, job_dir: Option<&Path>) -> Result<(), String> {
     let text = std::fs::read_to_string(spec_path).map_err(|e| e.to_string())?;
     let spec: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    // The spec belongs with the job's log from here on; the shared file it
+    // was handed over in has served its purpose.
+    if let Some(dir) = job_dir {
+        let _ = std::fs::write(dir.join("spec.json"), &text);
+    }
+    let _ = std::fs::remove_file(spec_path);
     let get = |k: &str| {
         spec.get(k)
             .and_then(Value::as_str)
@@ -1445,7 +1491,6 @@ pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
     };
     let tree = ProductTree::parse(&text).map_err(|e| e.to_string())?;
 
-    let job_dir = std::env::var("WM_JOB_DIR").map(PathBuf::from).ok();
     let artifacts = tree.artifacts_for_selection(products.iter().map(String::as_str));
     let total: u64 = artifacts.iter().filter_map(|a| a.compressed_size).sum();
     let mut progress = wm_core::progress::Progress::new("downloading", artifacts.len(), total);
@@ -1883,4 +1928,44 @@ pub fn profile_provision() -> Tool {
             ))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spec_files_do_not_collide() {
+        let jobs = Path::new("/tmp/jobs");
+        let a = spec_file(jobs);
+        let b = spec_file(jobs);
+        assert_ne!(a, b);
+        assert!(a
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("install-spec-"));
+    }
+
+    #[test]
+    fn a_job_that_fails_closes_its_progress() {
+        // `--watch` returns only when progress.json is finished; a failure
+        // before the first artifact used to leave it open for good.
+        let dir = std::env::temp_dir().join(format!("wm-native-job-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = run_install_job_in(Path::new("/nonexistent/spec.json"), Some(&dir))
+            .expect_err("no spec, no install");
+        let progress = wm_core::progress::Progress::read(&dir).expect("progress.json written");
+        assert_eq!(progress.finished, Some(false));
+        assert!(
+            progress
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains(&err)),
+            "{:?}",
+            progress.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
