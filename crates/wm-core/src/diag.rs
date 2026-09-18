@@ -115,6 +115,55 @@ pub const SIGNATURES: &[Signature] = &[
                  custom_wrapper.conf, which fixes do not overwrite.",
     },
     Signature {
+        id: "installer-signature-validity",
+        tool: Tool::Installer,
+        exit_code: None,
+        patterns: &[
+            "Verification failed: validity check failed",
+            "Incomplete mirroring Build modules",
+        ],
+        cause: "The installer refuses every module it downloaded, because the certificate \
+                that signed them is outside its validity window today. IBM's code-signing \
+                certificate for the 12.1 modules expired on 2026-08-28. The modules are \
+                intact and they do carry an RFC 3161 timestamp token, which is what normally \
+                keeps a signature valid after the signing certificate expires — the \
+                installer's SignatureValidator checks the certificate against the current \
+                date and the evidence is that it does not honour that token. Nothing about \
+                the selection, the machine or the account causes it: every product fails \
+                identically, and the run ends in a partial installation with 'Provisioning \
+                step command exited with exit code 5'.",
+        remedy: "Nothing on this machine fixes it; the certificate is IBM's and the check is \
+                 the shipped installer's. Use native_install, which is unaffected because it \
+                 does not validate the JAR signature chain — it verifies each artifact \
+                 against the sha256 the authenticated catalogue declares. That is a different \
+                 trust model, not the same check by another route, and worth stating to \
+                 whoever signs off the install. Otherwise the fix is a support case for \
+                 re-signed modules. Do not move the system clock: it would make the installer \
+                 accept modules whose signature it cannot currently validate, and breaks TLS \
+                 to the download centre in the same stroke.",
+    },
+    Signature {
+        id: "installer-client-outdated",
+        tool: Tool::Installer,
+        // The run ends in a generic `Installation failed (1)`, so the exit code
+        // distinguishes nothing; the sentence does.
+        exit_code: None,
+        patterns: &[
+            "server requires changes introduced in Installer Client version",
+            "Please download the newer version of Installer Client",
+        ],
+        cause: "The local installer binary is older than the download centre now accepts. \
+                The check happens after the product list has been fetched, so the run looks \
+                healthy for a minute and then stops at the licence prompt. The binary does \
+                not update itself, and nothing about a product selection causes this — an \
+                installer that worked last month fails today because the server moved.",
+        remedy: "Either fetch a current installer with installer_fetch and re-run against \
+                 that binary, or skip the binary altogether: native_install downloads and \
+                 unpacks the same artifacts over the same protocols and has no client \
+                 version to be out of date. The log line names the version required; \
+                 install_run checks the local binary against it before starting.",
+    },
+    Signature {
         id: "installer-empty-log",
         tool: Tool::Installer,
         exit_code: Some(255),
@@ -237,6 +286,53 @@ mod tests {
         let found = diagnose(log, Some(211), Some(Tool::UpdateManager));
         assert_eq!(found[0].signature.id, "sum-stale-lock");
         assert_eq!(found[0].matched_on.len(), 2);
+    }
+
+    #[test]
+    fn recognises_an_installer_client_the_server_has_outgrown() {
+        // Verbatim from a 12.1 run on 2026-09-18; the whole line is one the
+        // reader will paste back, so match it as it is actually printed.
+        let log = "Your Installer Client is version 12.1.0.0.123 033026. The server requires \
+                   changes introduced in Installer Client version 12.1.0.1.153 or later. \
+                   Please download the newer version of Installer Client from Passport \
+                   Advantage or Fix Central.";
+        let found = diagnose(log, Some(1), Some(Tool::Installer));
+        assert_eq!(found[0].signature.id, "installer-client-outdated");
+        // Both sentences match, and neither alone should be needed.
+        assert_eq!(found[0].matched_on.len(), 2);
+        for half in [
+            "The server requires changes introduced in Installer Client version 12.1.0.1.153",
+            "Please download the newer version of Installer Client from Fix Central",
+        ] {
+            assert_eq!(
+                diagnose(half, None, Some(Tool::Installer))[0].signature.id,
+                "installer-client-outdated",
+                "{half}"
+            );
+        }
+    }
+
+    #[test]
+    fn recognises_modules_refused_for_certificate_validity() {
+        // Verbatim from install-869858 on 2026-09-18, 21 days after IBM's
+        // code-signing certificate expired on 2026-08-28.
+        let log = "Cannot mirror products from https://sdc.webmethods.io/dataservewebM121/\
+                   repository/ to file:/tmp/sagPartialMirror454. Reason: Severity: ERROR,\
+                   Incomplete mirroring Build modules. ; Status ERROR: \
+                   com.webmethods.plm.sd.common.SignatureValidator code=0 Signature \
+                   Verification for e2ei,11,DEP_12.1.0.0.1560,BM_Deployer-ALL-Any.zip failed \
+                   with  Verification failed: validity check failed";
+        let found = diagnose(log, Some(1), Some(Tool::Installer));
+        assert_eq!(found[0].signature.id, "installer-signature-validity");
+        // The remedy must not be mistaken for "native_install checks the same
+        // thing": it verifies a digest from the catalogue, not the signature.
+        assert!(
+            found[0]
+                .signature
+                .remedy
+                .contains("different \n                 trust model")
+                || found[0].signature.remedy.contains("different trust model")
+        );
     }
 
     #[test]

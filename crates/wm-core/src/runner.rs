@@ -311,6 +311,140 @@ pub fn job_state(dir: &Path) -> JobState {
     }
 }
 
+/// Everything known about a job, in one read.
+///
+/// Both servers used to assemble this by hand and put the useful half — the log
+/// tail and the diagnoses — only in the structured payload. A client that
+/// renders the text block, which is most of them, got "failed with exit code 1,
+/// 0 known cause(s)" and had to guess where the log was. The evidence belongs in
+/// the sentence a reader actually sees, so [`Report::summary`] puts it there.
+#[derive(Debug, Serialize)]
+pub struct Report {
+    /// The job's identifier.
+    pub job_id: String,
+    /// Its directory: the log, the wrapper it ran, the exit code.
+    pub job_dir: PathBuf,
+    /// The log file.
+    pub log: PathBuf,
+    /// Running, or finished with a code.
+    pub state: JobState,
+    /// The exit code once there is one.
+    pub exit_code: Option<i32>,
+    /// The last lines of the log.
+    pub tail: String,
+    /// How many lines that is.
+    pub tail_lines: usize,
+    /// Whether the log held more than the tail shows.
+    pub tail_truncated: bool,
+    /// Progress, while the job publishes any.
+    pub progress: Option<crate::progress::Progress>,
+    /// Known failures matching the tail and the exit code.
+    pub diagnoses: Vec<crate::diag::Diagnosis>,
+}
+
+impl Report {
+    /// Read the job `id` under `jobs_dir`, diagnosing failures as `tool`.
+    pub fn read(jobs_dir: &Path, id: &str, lines: usize, tool: crate::diag::Tool) -> Result<Self> {
+        let job_dir = jobs_dir.join(id);
+        if !job_dir.is_dir() {
+            return Err(Error::NotFound {
+                what: "job",
+                path: job_dir,
+            });
+        }
+        let log = job_dir.join("output.log");
+        let state = job_state(&job_dir);
+        let exit_code = match state {
+            JobState::Finished { exit_code } => Some(exit_code),
+            JobState::Running => None,
+        };
+        let text = tail(&log, lines)?;
+        let total = std::fs::read_to_string(&log).map_or(0, |t| t.lines().count());
+        let shown = text.lines().count();
+        // A failing run is diagnosed against the whole log, not the tail: the
+        // installer prints its own epilogue after the sentence that explains
+        // what went wrong, so the evidence is routinely off the end of 40 lines.
+        let diagnoses = match exit_code {
+            Some(code) if code != 0 => {
+                let whole = std::fs::read_to_string(&log).unwrap_or_else(|_| text.clone());
+                crate::diag::diagnose(&whole, Some(code), Some(tool))
+            }
+            _ => Vec::new(),
+        };
+        Ok(Self {
+            job_id: id.to_string(),
+            job_dir,
+            log,
+            state,
+            exit_code,
+            tail: text,
+            tail_lines: shown,
+            tail_truncated: total > shown,
+            progress: crate::progress::Progress::read(jobs_dir.join(id).as_path()),
+            diagnoses,
+        })
+    }
+
+    /// One block of text carrying the state, the diagnosis and the evidence.
+    pub fn summary(&self) -> String {
+        let mut out = match self.exit_code {
+            None => match &self.progress {
+                Some(p) => format!(
+                    "{}: {} — {:.0}% ({} of {}), {} elapsed{}",
+                    self.job_id,
+                    p.phase,
+                    p.fraction() * 100.0,
+                    crate::progress::human_bytes(p.bytes_done),
+                    crate::progress::human_bytes(p.bytes_total),
+                    crate::progress::human_time(p.elapsed()),
+                    match p.remaining() {
+                        Some(left) => format!(", about {} left", crate::progress::human_time(left)),
+                        None => String::new(),
+                    }
+                ),
+                None => format!("{}: running", self.job_id),
+            },
+            Some(0) => format!("{}: finished successfully", self.job_id),
+            Some(code) => format!("{}: failed with exit code {code}", self.job_id),
+        };
+        let failed = self.exit_code.is_some_and(|c| c != 0);
+        if failed {
+            out.push_str(&format!("\n\njob directory: {}", self.job_dir.display()));
+            if self.diagnoses.is_empty() {
+                out.push_str(
+                    "\n\nNo known failure signature matched. The log tail below is the \
+                     evidence; diagnose_log takes a larger log, and the installer's own \
+                     -debugFile, if one was written, holds more than this.",
+                );
+            } else {
+                for diagnosis in &self.diagnoses {
+                    out.push_str(&format!(
+                        "\n\n{} (matched on {})\n  cause:  {}\n  remedy: {}",
+                        diagnosis.signature.id,
+                        diagnosis.matched_on.join(", "),
+                        diagnosis.signature.cause,
+                        diagnosis.signature.remedy,
+                    ));
+                }
+            }
+        }
+        if !self.tail.trim().is_empty() && (failed || self.exit_code.is_none()) {
+            out.push_str(&format!(
+                "\n\nlast {} line(s) of {}{}:\n{}",
+                self.tail_lines,
+                self.log.display(),
+                if self.tail_truncated {
+                    ", truncated"
+                } else {
+                    ""
+                },
+                self.tail,
+            ));
+        }
+        out
+    }
+}
+
 /// The last `lines` lines of a job's log.
 pub fn tail(log: &Path, lines: usize) -> Result<String> {
     if !log.is_file() {

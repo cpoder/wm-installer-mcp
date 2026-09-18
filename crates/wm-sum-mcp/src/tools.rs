@@ -10,6 +10,9 @@ use wm_core::diag;
 use wm_core::runner::{self, Environment};
 use wm_core::sum::{self, Action, FixScript, FixStep, SumCommand};
 
+/// Which product's failure signatures this server's jobs are matched against.
+const TOOL: diag::Tool = diag::Tool::UpdateManager;
+
 /// Name of the environment variable holding the entitlement key.
 ///
 /// Jobs reference it by name so the value never reaches the wrapper script.
@@ -438,8 +441,10 @@ fn sum_result() -> Tool {
 fn job_status() -> Tool {
     Tool::new(
         "job_status",
-        "Poll a job started by fix_run: whether it is still running, its exit code, the tail \
-         of its log, and any matching diagnosis.",
+        "Poll a job: whether it is still running, its progress, its exit code, the matching \
+         failure signature when it failed, and the tail of its log. A failed job returns the \
+         cause, the remedy and the evidence in the text itself, along with the job directory \
+         — there is nothing further to go and find.",
         json!({
             "type": "object",
             "required": ["job_id"],
@@ -450,33 +455,16 @@ fn job_status() -> Tool {
         }),
         Box::new(|args| {
             let id = req_str(args, "job_id")?;
-            let dir = jobs_dir().join(&id);
-            if !dir.is_dir() {
-                return Err(ToolError::invalid(format!("no such job: {id}")));
-            }
-            let log = dir.join("output.log");
-            let state = runner::job_state(&dir);
-            let tail = runner::tail(&log, opt_usize(args, "lines").unwrap_or(40))
-                .map_err(ToolError::failed)?;
-            let exit_code = match state {
-                runner::JobState::Finished { exit_code } => Some(exit_code),
-                runner::JobState::Running => None,
-            };
-            let diagnoses = match exit_code {
-                Some(code) if code != 0 => {
-                    diag::diagnose(&tail, Some(code), Some(diag::Tool::UpdateManager))
-                }
-                _ => Vec::new(),
-            };
-            let summary = match exit_code {
-                None => format!("{id}: running"),
-                Some(0) => format!("{id}: finished successfully"),
-                Some(code) => format!("{id}: failed with exit code {code}"),
-            };
-            Ok(ToolResult::structured(
-                summary,
-                json!({ "job_id": id, "state": state, "log": log, "tail": tail, "diagnoses": diagnoses }),
-            ))
+            let report = runner::Report::read(
+                &jobs_dir(),
+                &id,
+                opt_usize(args, "lines").unwrap_or(40),
+                TOOL,
+            )
+            .map_err(|e| ToolError::invalid(e.to_string()))?;
+            let structured = serde_json::to_value(&report)
+                .map_err(|e| ToolError::failed(format!("cannot serialise the job report: {e}")))?;
+            Ok(ToolResult::structured(report.summary(), structured))
         }),
     )
 }

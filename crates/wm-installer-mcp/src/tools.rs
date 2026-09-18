@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use mcp_rt::{Server, Tool, ToolError, ToolResult};
 use serde_json::{json, Value};
 use wm_core::catalog::{Catalog, ProductPath};
+use wm_core::client;
 use wm_core::deps;
 use wm_core::diag;
 use wm_core::inventory::Inventory;
@@ -12,6 +13,9 @@ use wm_core::runner::{self, Environment};
 use wm_core::script::{InstallScript, Severity, Source};
 
 use mcp_rt::args::{flag, opt_i32, opt_str, opt_usize, req_str, str_list};
+
+/// Which product's failure signatures this server's jobs are matched against.
+const TOOL: diag::Tool = diag::Tool::Installer;
 
 /// Default installer server for 12.1, as shipped in `sagInstaller.jar`.
 const DEFAULT_SERVER_URL: &str = "https://sdc.webmethods.io/cgi-bin/dataservewebM121.cgi";
@@ -646,7 +650,8 @@ fn image_build() -> Tool {
                 "java_options": { "type": "string" },
                 "disable_cpu_detection_test": { "type": "boolean" },
                 "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Variables for the script's $NAME$ placeholders." },
-                "passthrough_env": { "type": "array", "items": { "type": "string" }, "description": "Variable names this server already has, referenced by the job rather than written into it — use for credentials." }
+                "passthrough_env": { "type": "array", "items": { "type": "string" }, "description": "Variable names this server already has, referenced by the job rather than written into it — use for credentials." },
+                "skip_version_check": { "type": "boolean", "description": "Start even when the installer binary looks older than the catalogue expects." }
             }
         }),
         Box::new(|args| {
@@ -661,6 +666,7 @@ fn image_build() -> Tool {
                 .into_iter()
                 .filter(|f| f.severity == Severity::Error)
                 .collect();
+            let check = preflight_installer(args, &installer)?;
             if !blocking.is_empty() {
                 return Err(ToolError::failed(format!(
                     "refusing to start: the installer would reject this script ({})",
@@ -701,6 +707,13 @@ fn image_build() -> Tool {
 
 fn install_run() -> Tool {
     Tool::new(
+            let mut summary = format!("image build started as {} -> {output}", job.id);
+            if let Some(version) = &check.local {
+                summary.push_str(&format!(" with installer client {version}"));
+            }
+            if let Some(warning) = check.warning() {
+                summary.push_str(&format!("\n\nnote: {warning}"));
+            }
         "install_run",
         "Start an installation from a script, optionally from an image. Returns a job id; \
          poll it with job_status. Validates the script first, because the installer only \
@@ -717,7 +730,9 @@ fn install_run() -> Tool {
                 "java_options": { "type": "string" },
                 "disable_cpu_detection_test": { "type": "boolean" },
                 "env": { "type": "object", "additionalProperties": { "type": "string" } },
-                "passthrough_env": { "type": "array", "items": { "type": "string" }, "description": "Variable names referenced by the job rather than written into it." }
+                "passthrough_env": { "type": "array", "items": { "type": "string" }, "description": "Variable names referenced by the job rather than written into it." },
+                "platform": { "type": "string", "description": "Platform whose cached catalogue the installer's version is checked against." },
+                "skip_version_check": { "type": "boolean", "description": "Start even when the installer binary looks older than the catalogue expects." }
             }
         }),
         Box::new(|args| {
@@ -738,6 +753,7 @@ fn install_run() -> Tool {
                         .collect::<Vec<_>>()
                         .join("; ")
                 )));
+            let check = preflight_installer(args, &installer)?;
             }
 
             let mut cmd_args = vec!["-console".into(), "-readScript".into(), script.clone()];
@@ -772,11 +788,20 @@ fn install_run() -> Tool {
 fn job_status() -> Tool {
     Tool::new(
         "job_status",
-        "Poll a job started by image_build or install_run: whether it is still running, its \
-         exit code, the tail of its log, and — when it failed — the matching diagnosis.",
+        "Poll a job: whether it is still running, its progress, its exit code, the matching \
+         failure signature when it failed, and the tail of its log. A failed job returns the \
+         cause, the remedy and the evidence in the text itself, along with the job directory \
+         — there is nothing further to go and find.",
         json!({
             "type": "object",
             "required": ["job_id"],
+            let mut summary = format!("installation started as {}", job.id);
+            if let Some(version) = &check.local {
+                summary.push_str(&format!(" with installer client {version}"));
+            }
+            if let Some(warning) = check.warning() {
+                summary.push_str(&format!("\n\nnote: {warning}"));
+            }
             "properties": {
                 "job_id": { "type": "string" },
                 "lines": { "type": "integer", "description": "Log lines to return (default 40)." }
@@ -784,59 +809,16 @@ fn job_status() -> Tool {
         }),
         Box::new(|args| {
             let id = req_str(args, "job_id")?;
-            let dir = jobs_dir().join(&id);
-            if !dir.is_dir() {
-                return Err(ToolError::invalid(format!("no such job: {id}")));
-            }
-            let log = dir.join("output.log");
-            let state = runner::job_state(&dir);
-            let tail = runner::tail(&log, opt_usize(args, "lines").unwrap_or(40))
-                .map_err(ToolError::failed)?;
-            let exit_code = match state {
-                runner::JobState::Finished { exit_code } => Some(exit_code),
-                runner::JobState::Running => None,
-            };
-            let diagnoses = match exit_code {
-                Some(code) if code != 0 => {
-                    diag::diagnose(&tail, Some(code), Some(diag::Tool::Installer))
-                }
-                _ => Vec::new(),
-            };
-            let progress = wm_core::progress::Progress::read(&dir);
-            let summary = match exit_code {
-                None => match &progress {
-                    Some(p) => format!(
-                        "{id}: {} — {:.0}% ({} of {}), {} elapsed{}",
-                        p.phase,
-                        p.fraction() * 100.0,
-                        wm_core::progress::human_bytes(p.bytes_done),
-                        wm_core::progress::human_bytes(p.bytes_total),
-                        wm_core::progress::human_time(p.elapsed()),
-                        match p.remaining() {
-                            Some(left) =>
-                                format!(", about {} left", wm_core::progress::human_time(left)),
-                            None => String::new(),
-                        }
-                    ),
-                    None => format!("{id}: running"),
-                },
-                Some(0) => format!("{id}: finished successfully"),
-                Some(code) => format!(
-                    "{id}: failed with exit code {code}, {} known cause(s)",
-                    diagnoses.len()
-                ),
-            };
-            Ok(ToolResult::structured(
-                summary,
-                json!({
-                    "job_id": id,
-                    "state": state,
-                    "log": log,
-                    "tail": tail,
-                    "diagnoses": diagnoses,
-                    "progress": progress,
-                }),
-            ))
+            let report = runner::Report::read(
+                &jobs_dir(),
+                &id,
+                opt_usize(args, "lines").unwrap_or(40),
+                TOOL,
+            )
+            .map_err(|e| ToolError::invalid(e.to_string()))?;
+            let structured = serde_json::to_value(&report)
+                .map_err(|e| ToolError::failed(format!("cannot serialise the job report: {e}")))?;
+            Ok(ToolResult::structured(report.summary(), structured))
         }),
     )
 }
