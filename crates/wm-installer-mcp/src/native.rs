@@ -351,140 +351,340 @@ pub fn sdc_catalog() -> Tool {
     )
 }
 
-/// Resolve a selection and price the download.
+/// The shared part of `native_plan` and `native_install`: turn what the caller
+/// asked for into the closure, then split that against what is already there.
+struct Selection {
+    /// Seeds that matched a product in the catalogue.
+    seeds: Vec<String>,
+    /// Seeds that matched nothing.
+    unknown: Vec<String>,
+    /// Prerequisites nothing in the catalogue satisfies.
+    unsatisfied: Vec<deps::Unsatisfied>,
+    /// The full dependency closure, before anything is subtracted.
+    closure: Vec<String>,
+    /// The installation this was priced against, if there is one.
+    target: Option<PathBuf>,
+    /// How the closure divides against that installation. `None` when the
+    /// target does not exist yet, which is a fresh install.
+    delta: Option<install::Delta>,
+    /// Fix readmes the target carries, which is what a reinstall would undo.
+    installed_fixes: usize,
+}
+
+impl Selection {
+    /// What would actually be written: the closure for a fresh installation,
+    /// the difference for an existing one, plus the version changes when the
+    /// caller has forced them.
+    fn products(&self, force: bool) -> Vec<String> {
+        match &self.delta {
+            None => self.closure.clone(),
+            Some(delta) if force => delta.forced(),
+            Some(delta) => delta.to_install.clone(),
+        }
+    }
+
+    /// The version changes left alone, which the caller must be told about.
+    fn not_performed(&self) -> &[install::VersionChange] {
+        self.delta.as_ref().map_or(&[], |d| &d.version_changes)
+    }
+
+    /// Structured form of the subtraction, for a tool result.
+    fn as_json(&self) -> Value {
+        match &self.delta {
+            None => json!({
+                "target": self.target.as_ref().map(|p| p.display().to_string()),
+                "fresh_install": true,
+            }),
+            Some(delta) => json!({
+                "target": self.target.as_ref().map(|p| p.display().to_string()),
+                "fresh_install": false,
+                "installed_fixes": self.installed_fixes,
+                "already_installed": delta.already_installed,
+                "already_installed_count": delta.already_installed.len(),
+                "version_changes": delta.version_changes,
+                "to_install": delta.to_install,
+            }),
+        }
+    }
+}
+
+/// Resolve a selection and subtract the target installation from it.
+fn select(args: &Value, tree: &ProductTree) -> Result<Selection, ToolError> {
+    let catalog = tree.catalog();
+    let mut seeds = Vec::new();
+    let mut unknown = Vec::new();
+    for wanted in str_list(args, "products") {
+        match catalog
+            .get(&wanted)
+            .map(|_| wanted.clone())
+            .or_else(|| catalog.path_of(&wanted).map(|p| p.raw.clone()))
+        {
+            Some(path) => seeds.push(path),
+            None => unknown.push(wanted),
+        }
+    }
+    if seeds.is_empty() {
+        return Err(ToolError::invalid(format!(
+            "none of the requested products exist in the catalogue: {}. catalog_search finds \
+             the exact versioned paths",
+            unknown.join(", ")
+        )));
+    }
+    let resolution = deps::resolve(&catalog, &seeds, flag(args, "include_mandatory", true))
+        .map_err(ToolError::failed)?;
+    let closure = resolution.paths();
+
+    let target = target_path(args)?;
+    let existing = target.as_deref().and_then(existing_inventory);
+    Ok(Selection {
+        seeds,
+        unknown,
+        unsatisfied: resolution.unsatisfied,
+        delta: existing.as_ref().map(|inv| install::delta(&closure, inv)),
+        installed_fixes: existing.as_ref().map_or(0, |inv| inv.fixes.len()),
+        closure,
+        target,
+    })
+}
+
+/// One line per version change, for a human to read.
+fn describe_changes(changes: &[install::VersionChange]) -> String {
+    let width = changes
+        .iter()
+        .map(|c| c.component.len())
+        .max()
+        .unwrap_or(0)
+        .min(40);
+    changes
+        .iter()
+        .map(|c| {
+            format!(
+                "  {:width$}  installed {}  catalogue {}",
+                c.component, c.installed_version, c.catalog_version
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Why a version change is not performed, and what to do instead.
+///
+/// A product's `.prop` file records the version it was *installed* at, never its
+/// fix level: a product Update Manager has patched still reports its base
+/// version, and the only on-disk trace of the patching is the readmes counted
+/// here. So "the catalogue has a newer version" is not a reason to unpack it —
+/// doing that replaces patched files with base-version copies whichever version
+/// is numerically higher. The path that raises a patched product is Update
+/// Manager, not this one.
+fn why_not_performed(installed_fixes: usize) -> String {
+    let patched = if installed_fixes > 0 {
+        format!(
+            " This installation carries {installed_fixes} fix readme(s), and a .prop file \
+             records the version a product was installed at rather than its fix level: \
+             unpacking the catalogue version over a patched product replaces corrected files \
+             with base-version copies — including when the catalogue version is the newer of \
+             the two — and nothing afterwards records that the fix level dropped."
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "Products already present under a different version are not reinstalled.{patched} \
+         Move them with the Update Manager server instead — fixes_available, fixes_download, \
+         fix_apply — which is the path that keeps the fix level. force=true overwrites them \
+         from the catalogue, and is a last resort."
+    )
+}
+
 pub fn native_plan() -> Tool {
     Tool::new(
         "native_plan",
         "Resolve a product selection against IBM's catalogue and report exactly what would be \
          downloaded and installed: the prerequisite closure, the artifact list with its total \
          size, and — importantly — which products declare Java install panels that a native \
-         install cannot run.",
+         install cannot run. Name an existing installation with `install`, `install_dir` or \
+         `wm_home` and the plan is priced against what it already has: products present at the \
+         same version drop out, products present at a different version are listed apart as \
+         not-performed, and the size quoted is the size of the difference rather than of the \
+         whole closure. Without one, it prices a fresh installation.",
         json!({
             "type": "object",
-            "required": ["release", "products"],
+            "required": ["products"],
             "properties": {
-                "release": { "type": "string" },
+                "release": { "type": "string", "description": "Release number, code, sandbox or display name — 12.1, 2026_May and webM121 all work. Defaults to the configured release." },
                 "platform": { "type": "string" },
                 "products": { "type": "array", "items": { "type": "string" }, "description": "Component names or full versioned paths." },
+                "install": { "type": "string", "description": "Registered installation to price this against; install_list shows the names." },
+                "install_dir": { "type": "string", "description": "Installation to price this against, as a path or a registered name. Omitted, the plan is for a fresh installation." },
                 "include_mandatory": { "type": "boolean", "description": "Inject the undeclared base products (default true)." },
                 "host": { "type": "string" }
             }
         }),
         Box::new(|args| {
-            let release = req_str(args, "release")?;
-            let platform = opt_str(args, "platform").unwrap_or_else(|| "LNXAMD64".into());
+            let release = release_arg(args)?;
+            let platform = platform_arg(args);
             let (tree, _) = tree_for(args, &release, &platform)?;
-            let catalog = tree.catalog();
+            let selection = select(args, &tree)?;
 
-            let mut seeds = Vec::new();
-            let mut unknown = Vec::new();
-            for wanted in str_list(args, "products") {
-                match catalog
-                    .get(&wanted)
-                    .map(|_| wanted.clone())
-                    .or_else(|| catalog.path_of(&wanted).map(|p| p.raw.clone()))
-                {
-                    Some(path) => seeds.push(path),
-                    None => unknown.push(wanted),
-                }
-            }
-            if seeds.is_empty() {
-                return Err(ToolError::invalid(
-                    "none of the requested products exist in the catalogue",
+            let products = selection.products(false);
+            let plan = install::plan(&tree, &products);
+            // What the closure would have cost without the subtraction, so the
+            // saving is stated rather than left to be inferred.
+            let whole = install::plan(&tree, &selection.closure);
+
+            let mut summary = match &selection.delta {
+                None => format!(
+                    "{} products ({} after closure), {} artifacts, {:.2} GB to download",
+                    selection.seeds.len(),
+                    plan.products.len(),
+                    plan.artifacts.len(),
+                    plan.download_bytes as f64 / 1e9
+                ),
+                Some(delta) => format!(
+                    "{} of {} products to install ({} already present at these versions), \
+                     {} artifacts, {} to download — against the whole closure's {}",
+                    products.len(),
+                    selection.closure.len(),
+                    delta.already_installed.len(),
+                    plan.artifacts.len(),
+                    wm_core::progress::human_bytes(plan.download_bytes),
+                    wm_core::progress::human_bytes(whole.download_bytes),
+                ),
+            };
+            if !selection.not_performed().is_empty() {
+                summary.push_str(&format!(
+                    "\n\n{} product(s) present under a different version, NOT performed:\n{}\n\n{}",
+                    selection.not_performed().len(),
+                    describe_changes(selection.not_performed()),
+                    why_not_performed(selection.installed_fixes),
                 ));
             }
-            let resolution = deps::resolve(&catalog, &seeds, flag(args, "include_mandatory", true))
-                .map_err(ToolError::failed)?;
-            let paths = resolution.paths();
-            let plan = install::plan(&tree, &paths);
-
-            let mut summary = format!(
-                "{} products ({} after closure), {} artifacts, {:.2} GB to download",
-                seeds.len(),
-                plan.products.len(),
-                plan.artifacts.len(),
-                plan.download_bytes as f64 / 1e9
-            );
             if !plan.products_with_panels.is_empty() {
                 summary.push_str(&format!(
-                    "; {} product(s) declare install panels a native install does not run",
+                    "\n\n{} product(s) declare install panels a native install does not run.",
                     plan.products_with_panels.len()
                 ));
             }
             Ok(ToolResult::structured(
                 summary,
                 json!({
-                    "complete": resolution.unsatisfied.is_empty() && unknown.is_empty(),
-                    "unknown_products": unknown,
-                    "unsatisfied": resolution.unsatisfied,
-                    "products": paths,
+                    "complete": selection.unsatisfied.is_empty() && selection.unknown.is_empty(),
+                    "unknown_products": selection.unknown,
+                    "unsatisfied": selection.unsatisfied,
+                    "release": release,
+                    "platform": platform,
+                    "closure": selection.closure,
+                    "products": products,
                     "artifact_count": plan.artifacts.len(),
                     "download_bytes": plan.download_bytes,
                     "expanded_bytes": plan.expanded_bytes,
+                    "whole_closure_download_bytes": whole.download_bytes,
                     "products_with_panels": plan.products_with_panels,
+                    "installation": selection.as_json(),
                 }),
             ))
         }),
     )
 }
 
-/// Run a native install as a detached job.
+/// Run a native install as a detached job, incrementally.
 pub fn native_install() -> Tool {
     Tool::new(
         "native_install",
         "Download and install a product selection straight from IBM: no installer binary, no \
          JVM, no image. Every artifact is verified against the sha256 the catalogue declares \
          before it is unpacked, and the installation is left self-describing \
-         (install/bms/*.contents, install/products/*.prop). Returns a job id — poll it with \
-         job_status. Java install panels are not run; see native_plan.",
+         (install/bms/*.contents, install/products/*.prop). Installing into an existing \
+         installation is incremental: products already present at the same version are not \
+         fetched, and products present at a *different* version are reported as not performed \
+         rather than overwritten — laying a catalogue version over a patched product silently \
+         undoes applied fixes. `force: true` overwrites them anyway. Returns a job id — poll it \
+         with job_status. Java install panels are not run; see native_plan.",
         json!({
             "type": "object",
-            "required": ["release", "products", "install_dir"],
+            "required": ["products"],
             "properties": {
-                "release": { "type": "string" },
+                "release": { "type": "string", "description": "Release number, code, sandbox or display name. Defaults to the configured release." },
                 "platform": { "type": "string" },
                 "products": { "type": "array", "items": { "type": "string" } },
-                "installer_jar": { "type": "string", "description": "Path to the installer's own jar (sagInstaller.jar, inside the downloaded installer). It is laid down as install/jars/DistMan.jar, which is where the shipped tooling looks for it — is_instance.xml puts it on the instance manager's classpath. Defaults to $WM_INSTALLER_JAR." },
-                "install_dir": { "type": "string" },
+                "installer_jar": { "type": "string", "description": "Path to the installer's own jar (sagInstaller.jar, inside the downloaded installer). It is laid down as install/jars/DistMan.jar, which is where the shipped tooling looks for it — is_instance.xml puts it on the instance manager's classpath. Defaults to the configured installer_jar, then $WM_INSTALLER_JAR." },
+                "install": { "type": "string", "description": "Registered installation to install into; install_list shows the names." },
+                "install_dir": { "type": "string", "description": "Where to install, as a path or a registered name. A directory that does not exist yet is a fresh installation." },
                 "include_mandatory": { "type": "boolean" },
+                "force": { "type": "boolean", "description": "Also reinstall products the target carries under a different version, overwriting them. This is how an applied fix is lost; default false." },
                 "host": { "type": "string" }
             }
         }),
         Box::new(|args| {
             // Validate the plan before spawning: a job that fails on its first
             // call has cost a process and told the caller nothing new.
-            let release = req_str(args, "release")?;
-            let install_dir = req_str(args, "install_dir")?;
-            let platform = opt_str(args, "platform").unwrap_or_else(|| "LNXAMD64".into());
+            let release = release_arg(args)?;
+            let platform = platform_arg(args);
+            let install_dir = target_path(args)?.ok_or_else(|| {
+                ToolError::invalid(
+                    "no install_dir given: name a directory to install into, or a registered \
+                     installation with install",
+                )
+            })?;
             credentials()?;
             let (tree, _) = tree_for(args, &release, &platform)?;
-            let catalog = tree.catalog();
-            let mut seeds = Vec::new();
-            for wanted in str_list(args, "products") {
-                if let Some(path) = catalog
-                    .get(&wanted)
-                    .map(|_| wanted.clone())
-                    .or_else(|| catalog.path_of(&wanted).map(|p| p.raw.clone()))
-                {
-                    seeds.push(path);
-                }
-            }
-            if seeds.is_empty() {
-                return Err(ToolError::invalid(
-                    "none of the requested products exist in the catalogue",
+            let selection = select(args, &tree)?;
+
+            let force = flag(args, "force", false);
+            let products = selection.products(force);
+            let not_performed = selection.not_performed().to_vec();
+
+            // Nothing to fetch. Say which of the two reasons it is, because
+            // "already installed" and "refused to overwrite" call for very
+            // different next steps.
+            if products.is_empty() {
+                let summary = if not_performed.is_empty() {
+                    format!(
+                        "nothing to install: all {} products of the closure are already present \
+                         in {} at these versions",
+                        selection.closure.len(),
+                        install_dir.display()
+                    )
+                } else {
+                    format!(
+                        "nothing installed. {} product(s) are present under a different \
+                         version, NOT performed:\n{}\n\n{}",
+                        not_performed.len(),
+                        describe_changes(&not_performed),
+                        why_not_performed(selection.installed_fixes),
+                    )
+                };
+                return Ok(ToolResult::structured(
+                    summary,
+                    json!({
+                        "job_id": Value::Null,
+                        "products": 0,
+                        "installation": selection.as_json(),
+                    }),
                 ));
             }
-            let resolution = deps::resolve(&catalog, &seeds, flag(args, "include_mandatory", true))
-                .map_err(ToolError::failed)?;
 
+            let register = registry::find_by_home(&install_dir).map(|i| i.name);
             let spec = json!({
                 "release": release,
                 "platform": platform,
-                "install_dir": install_dir,
-                "products": resolution.paths(),
+                "install_dir": install_dir.display().to_string(),
+                "products": products,
                 "host": host(args),
                 "installer_jar": opt_str(args, "installer_jar")
+                    .or_else(|| defaults().installer_jar.map(|p| p.display().to_string()))
                     .or_else(|| std::env::var("WM_INSTALLER_JAR").ok()),
+                // Carried so the job's own log records what it deliberately
+                // left alone, not only what it wrote.
+                "skipped_already_installed": selection
+                    .delta
+                    .as_ref()
+                    .map_or(0, |d| d.already_installed.len()),
+                "skipped_version_changes": not_performed
+                    .iter()
+                    .map(|c| c.installed.clone())
+                    .collect::<Vec<_>>(),
+                "register": register,
             });
             let jobs = jobs_dir();
             std::fs::create_dir_all(&jobs)
@@ -518,15 +718,435 @@ pub fn native_install() -> Tool {
                 &env,
             )
             .map_err(ToolError::failed)?;
+
+            let mut summary = match &selection.delta {
+                None => format!(
+                    "native install started as {} into {}: {} product(s)",
+                    job.id,
+                    install_dir.display(),
+                    products.len()
+                ),
+                Some(delta) => format!(
+                    "incremental install started as {} into {}: {} product(s) of a {}-product \
+                     closure, {} already present",
+                    job.id,
+                    install_dir.display(),
+                    products.len(),
+                    selection.closure.len(),
+                    delta.already_installed.len()
+                ),
+            };
+            if !not_performed.is_empty() {
+                summary.push_str(&format!(
+                    "\n\n{} product(s) present under a different version, {}:\n{}\n\n{}",
+                    not_performed.len(),
+                    if force {
+                        "OVERWRITTEN because force=true"
+                    } else {
+                        "NOT performed"
+                    },
+                    describe_changes(&not_performed),
+                    if force {
+                        format!(
+                            "force=true, so these are being overwritten from the catalogue.{} \
+                             Re-apply anything they were patched with through the Update \
+                             Manager server once this job finishes.",
+                            if selection.installed_fixes > 0 {
+                                format!(
+                                    " This installation carries {} fix readme(s); patched \
+                                     files inside these products are being replaced by \
+                                     base-version copies.",
+                                    selection.installed_fixes
+                                )
+                            } else {
+                                String::new()
+                            }
+                        )
+                    } else {
+                        why_not_performed(selection.installed_fixes)
+                    },
+                ));
+            }
             Ok(ToolResult::structured(
-                format!("native install started as {} into {install_dir}", job.id),
-                json!({ "job_id": job.id, "log": job.log, "products": resolution.len() }),
+                summary,
+                json!({
+                    "job_id": job.id,
+                    "log": job.log,
+                    "job_dir": jobs.join(&job.id).display().to_string(),
+                    "products": products.len(),
+                    "forced": force,
+                    "installation": selection.as_json(),
+                }),
             ))
         }),
     )
 }
 
-/// Create an Integration Server instance.
+/// Check an installation against the manifests it carries.
+pub fn install_verify() -> Tool {
+    Tool::new(
+        "install_verify",
+        "Check what an installation says it holds against what is on its disk, by reading the \
+         manifests it carries in install/bms/*.contents. This is the difference between a \
+         product being *claimed* and being *complete*: install/products/*.prop records that a \
+         product was placed, which is what an incremental plan trusts, and a run that failed \
+         part-way leaves that record standing.\n\n\
+         A declared file being absent is usually correct, and the report classifies rather \
+         than counts. Applying a fix deletes files and puts newer ones in their place without \
+         rewriting the manifest, so an absence with a differently-versioned neighbour beside \
+         it is Update Manager having done its job. One finding is conclusive — an artifact of \
+         which *nothing* was written, which is a product recorded as installed that is not \
+         there. The rest are absences nothing accounts for: a prompt to look, not a verdict, \
+         because a mature installation has other innocent reasons for them and this does not \
+         adjudicate between them.\n\n\
+         Needs no credentials and touches nothing, so it works on a stopped installation. It \
+         checks presence, not content: the manifests carry no sizes or digests, so a truncated \
+         file passes.",
+        json!({
+            "type": "object",
+            "properties": {
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
+                "wm_home": { "type": "string", "description": "Installation root, or a registered name." },
+                "product": { "type": "string", "description": "Check only artifacts whose name or product path contains this, e.g. \"Deployer\" or \"DEP_12.1\". Omitted, everything is checked." },
+                "limit": { "type": "integer", "description": "Paths to list per artifact (default 10). The counts are always complete." },
+                "superseded": { "type": "boolean", "description": "List the absences a fix accounts for as well. Off by default: on a patched installation they are the overwhelming majority and none of them are faults." }
+            }
+        }),
+        Box::new(|args| {
+            let wm_home = required_home(args)?;
+            let report = wm_core::install::verify(&wm_home, opt_str(args, "product").as_deref())
+                .map_err(ToolError::failed)?;
+            let limit = opt_usize(args, "limit").unwrap_or(10);
+
+            if report.artifacts == 0 {
+                return Err(ToolError::failed(format!(
+                    "{} carries no manifests to check{}",
+                    wm_home.display(),
+                    match opt_str(args, "product") {
+                        Some(product) => format!(" that match {product:?}."),
+                        None =>
+                            ". install/bms/*.contents is written by a native install and by the \
+                             shipped installer, so an installation with none was made another \
+                             way."
+                                .to_string(),
+                    }
+                )));
+            }
+
+            let mut summary = format!(
+                "{}: {} artifact(s), {} declared path(s). {} absent — {} superseded by a newer \
+                 file, {} unaccounted for.",
+                wm_home.display(),
+                report.artifacts,
+                report.declared,
+                report.absent,
+                report.superseded,
+                report.unexplained,
+            );
+            if report.is_sound() {
+                summary
+                    .push_str("\n\nNothing here is wrong: every absence is a file a fix replaced.");
+            }
+
+            let mut show = |heading: &str, checks: &[wm_core::install::ArtifactCheck]| {
+                if checks.is_empty() {
+                    return;
+                }
+                summary.push_str(&format!("\n\n{heading}"));
+                for check in checks.iter().take(20) {
+                    summary.push_str(&format!(
+                        "\n\n{} — {} of {} absent, {} unaccounted for{}{}",
+                        check.artifact,
+                        check.absent.len(),
+                        check.declared,
+                        check.unexplained,
+                        match &check.product {
+                            Some(product) => format!("\n  {product}"),
+                            None => String::new(),
+                        },
+                        if check.base.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n  paths are relative to {}/", check.base)
+                        },
+                    ));
+                    let listed = check.absent.iter().filter(|absent| {
+                        absent.superseded_by.is_none() || flag(args, "superseded", false)
+                    });
+                    let mut shown = 0usize;
+                    for absent in listed.clone().take(limit) {
+                        summary.push_str(&format!(
+                            "\n  {}{}",
+                            absent.path,
+                            match &absent.superseded_by {
+                                Some(newer) => format!("   (superseded by {newer})"),
+                                None => String::new(),
+                            }
+                        ));
+                        shown += 1;
+                    }
+                    let total = listed.count();
+                    if total > shown {
+                        summary.push_str(&format!("\n  … and {} more", total - shown));
+                    }
+                }
+                if checks.len() > 20 {
+                    summary.push_str(&format!(
+                        "\n\n… and {} further artifact(s).",
+                        checks.len() - 20
+                    ));
+                }
+            };
+            show(
+                "NOTHING WAS WRITTEN for these artifacts. The installation records the product \
+                 and the files were never placed — an incremental plan will leave it alone, so \
+                 reinstall it with native_install and force=true.",
+                &report.never_written,
+            );
+            show("Absences nothing accounts for:", &report.incomplete);
+            if !report.unreadable.is_empty() {
+                summary.push_str(&format!(
+                    "\n\n{} manifest(s) could not be read: {}",
+                    report.unreadable.len(),
+                    report.unreadable.join(", ")
+                ));
+            }
+
+            let structured = serde_json::to_value(&report)
+                .map_err(|e| ToolError::failed(format!("cannot serialise the report: {e}")))?;
+            let result = ToolResult::structured(summary, structured);
+            Ok(if report.is_sound() {
+                result
+            } else {
+                result.into_error()
+            })
+        }),
+    )
+}
+
+/// A package published inside another package, rather than held in the
+/// repository.
+///
+/// `WmDeployer/pub/WmDeployerResource.zip` is the case that costs an afternoon:
+/// Deployer needs `WmDeployerResource` on every runtime it queries, including
+/// the one it runs on, and that package is not a repository package — it is an
+/// archive Deployer publishes for distribution. `is_instance.sh` cannot copy
+/// what is not in the repository, and says nothing about why.
+fn published_archive(repository: &Path, name: &str) -> Option<String> {
+    let exact = format!("{name}.zip");
+    let mut found: Vec<(bool, String)> = Vec::new();
+    for package in std::fs::read_dir(repository)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+    {
+        let Ok(files) = std::fs::read_dir(package.join("pub")) else {
+            continue;
+        };
+        for file in files.flatten().map(|e| e.path()) {
+            let Some(filename) = file.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            // `WmDeployerResource.zip` and `WmDeployerResource-11.zip` both
+            // match; the unversioned one is the current package, and the other
+            // is kept for older runtimes.
+            if filename.ends_with(".zip") && filename.starts_with(name) {
+                found.push((filename == exact, file.display().to_string()));
+            }
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    found.into_iter().next().map(|(_, path)| path)
+}
+
+/// Copy freshly installed packages into a running instance.
+pub fn instance_update() -> Tool {
+    Tool::new(
+        "instance_update",
+        "Bring an existing Integration Server instance up to date with the packages the \
+         installation carries, by running the product's own \
+         IntegrationServer/instances/is_instance.sh update. This step is required and \
+         invisible: installing a product that ships Integration Server packages fills the \
+         repository at IntegrationServer/packages and leaves every instance alone, so the \
+         server answers 'Unknown package' for a package the installation plainly contains and \
+         a successful install stays inoperative. Called with no package list, it reports which \
+         packages the installation has that this instance does not, and changes nothing. \
+         Defaults to a dry run.",
+        json!({
+            "type": "object",
+            "properties": {
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
+                "wm_home": { "type": "string", "description": "Installation root, or a registered name." },
+                "name": { "type": "string", "description": "Instance name (default \"default\")." },
+                "packages": { "type": "array", "items": { "type": "string" }, "description": "Packages to copy in. \"all\" means every non-core package, which is the script's own keyword — what counts as core is is_core_packages.properties' business, not this server's. Omitted, nothing is copied and the call only reports the difference." },
+                "db_type": { "type": "string", "description": "ORACLE, DB2, SQLSERVER, MYSQLCE, MYSQLEE or POSTGRESQL." },
+                "db_alias": { "type": "string" },
+                "db_url": { "type": "string" },
+                "db_username": { "type": "string" },
+                "db_password": { "type": "string" },
+                "apply": { "type": "boolean", "description": "Set true to run; otherwise a dry run." }
+            }
+        }),
+        Box::new(|args| {
+            let wm_home = required_home(args)?;
+            let name = opt_str(args, "name").unwrap_or_else(|| "default".into());
+            let instance_dir = wm_home
+                .join("IntegrationServer")
+                .join("instances")
+                .join(&name);
+            if !instance_dir.is_dir() {
+                return Err(ToolError::invalid(format!(
+                    "no instance {name:?} at {}; instance_create makes one",
+                    instance_dir.display()
+                )));
+            }
+            let missing = wm_core::instance::packages_not_in_instance(&wm_home, &name);
+            let packages = str_list(args, "packages");
+
+            // Nothing to copy and nothing asked for: this is the diagnosis, and
+            // running the script would change nothing.
+            if packages.is_empty() {
+                let summary = if missing.is_empty() {
+                    format!(
+                        "instance {name} already carries every package the installation has. \
+                         Nothing to do."
+                    )
+                } else {
+                    format!(
+                        "instance {name} is missing {} package(s) the installation carries:\n{}\n\n\
+                         Call again with packages=[…] to copy specific ones, or \
+                         packages=[\"all\"] for every non-core package. Nothing was changed.",
+                        missing.len(),
+                        missing
+                            .iter()
+                            .map(|p| format!("  {p}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                };
+                return Ok(ToolResult::structured(
+                    summary,
+                    json!({
+                        "instance": name,
+                        "missing_from_instance": missing,
+                        "changed": false,
+                    }),
+                ));
+            }
+
+            let options = wm_core::instance::ant::UpdateOptions {
+                packages: packages.clone(),
+                db_type: opt_str(args, "db_type"),
+                db_alias: opt_str(args, "db_alias"),
+                db_url: opt_str(args, "db_url"),
+                db_username: opt_str(args, "db_username"),
+                db_password: opt_str(args, "db_password"),
+            };
+            let invocation = wm_core::instance::ant::update(&wm_home, &name, &options)
+                .map_err(ToolError::failed)?;
+
+            // A package asked for that the repository does not hold is the
+            // mistake worth catching here: the script copies what it finds and
+            // says nothing about what it did not.
+            let repository = wm_home.join("IntegrationServer").join("packages");
+            let unknown: Vec<&String> = packages
+                .iter()
+                .filter(|p| p.as_str() != wm_core::instance::ant::ALL_PACKAGES)
+                .filter(|p| !repository.join(p).join("manifest.v3").is_file())
+                .collect();
+            if !unknown.is_empty() {
+                let published: Vec<String> = unknown
+                    .iter()
+                    .filter_map(|name| published_archive(&repository, name))
+                    .collect();
+                let mut message = format!(
+                    "{} is not in {}: {}. A package is only there once it carries a \
+                     manifest.v3, which is what Integration Server reads.",
+                    if unknown.len() == 1 {
+                        "a package"
+                    } else {
+                        "some packages"
+                    },
+                    repository.display(),
+                    unknown
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                if !published.is_empty() {
+                    message.push_str(&format!(
+                        "\n\nBut it does ship, published by another package for distribution \
+                         rather than held in the repository:\n{}\nA package that arrives this \
+                         way is not installed by is_instance.sh at all. It is copied into \
+                         <instance>/replicate/inbound and installed through the server's own \
+                         wm.server.packages:packageInstall — which is also what the \
+                         administration console's install button does when it works.",
+                        published
+                            .iter()
+                            .map(|p| format!("  {p}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ));
+                }
+                return Err(ToolError::invalid(message));
+            }
+
+            if !flag(args, "apply", false) {
+                let mut settings = Vec::new();
+                setting(&mut settings, "instance", &name, args.get("name").is_some());
+                setting(&mut settings, "packages", packages.join(", "), true);
+                for (key, value) in [
+                    ("db_type", &options.db_type),
+                    ("db_alias", &options.db_alias),
+                    ("db_url", &options.db_url),
+                    ("db_username", &options.db_username),
+                ] {
+                    if let Some(value) = value {
+                        setting(&mut settings, key, value, true);
+                    }
+                }
+                return Ok(ToolResult::structured(
+                    format!(
+                        "dry run: would copy {} package(s) into instance {name}. Put the \
+                         settings below to the user, confirm or amend them, then call again \
+                         with apply=true.",
+                        packages.len()
+                    ),
+                    json!({
+                        "command": invocation.display(),
+                        "settings": settings,
+                        "missing_from_instance": missing,
+                    }),
+                ));
+            }
+
+            let (ok, output) =
+                wm_core::instance::ant::run(&invocation).map_err(ToolError::failed)?;
+            let remaining = wm_core::instance::packages_not_in_instance(&wm_home, &name);
+            let copied: Vec<&String> = missing.iter().filter(|p| !remaining.contains(p)).collect();
+            let summary = format!(
+                "{} instance {name}: {} package(s) now present that were not. Restart the \
+                 instance for it to load them.",
+                if ok { "updated" } else { "FAILED to update" },
+                copied.len(),
+            );
+            let result = ToolResult::structured(
+                summary,
+                json!({
+                    "instance": name,
+                    "ok": ok,
+                    "copied": copied,
+                    "still_missing": remaining,
+                    "output": output,
+                    "command": invocation.display(),
+                }),
+            );
+            Ok(if ok { result } else { result.into_error() })
+        }),
+    )
+}
+
 pub fn instance_create() -> Tool {
     Tool::new(
         "instance_create",
@@ -539,6 +1159,7 @@ pub fn instance_create() -> Tool {
             "type": "object",
             "required": ["wm_home"],
             "properties": {
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
                 "wm_home": { "type": "string", "description": "Installation root." },
                 "name": { "type": "string", "description": "Instance name (default \"default\")." },
                 "primary_port": { "type": "integer", "description": "HTTP port; the script defaults to 5555." },
@@ -664,7 +1285,6 @@ pub fn instance_create() -> Tool {
                 wm_core::instance::ant::run(&invocation).map_err(ToolError::failed)?;
             if !ok {
                 return Err(ToolError::failed(format!(
-            let register = registry::find_by_home(&install_dir).map(|i| i.name);
                     "is_instance.sh failed:\n{}",
                     tail(&transcript, 25)
                 )));
@@ -706,6 +1326,7 @@ pub fn profile_capture() -> Tool {
             "type": "object",
             "required": ["wm_home", "profile", "output"],
             "properties": {
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
                 "wm_home": { "type": "string", "description": "Installation to capture from." },
                 "profile": { "type": "string", "description": "Profile name, e.g. SPM or MWS_default." },
                 "output": { "type": "string", "description": "Archive to write." }
@@ -749,6 +1370,7 @@ pub fn profile_replay() -> Tool {
             "required": ["capture", "wm_home"],
             "properties": {
                 "capture": { "type": "string", "description": "Archive from profile_capture." },
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
                 "wm_home": { "type": "string", "description": "Installation to write into." },
                 "profile": { "type": "string", "description": "Name to give it; the captured name by default." },
                 "apply": { "type": "boolean", "description": "Set true to write; otherwise a dry run." }
@@ -837,6 +1459,29 @@ pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
         total as f64 / 1e9,
         install_dir.display()
     );
+    // What the planner deliberately left out. A log that records only what was
+    // written cannot afterwards answer "why is that product still at .938".
+    let skipped = spec
+        .get("skipped_already_installed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if skipped > 0 {
+        println!("{skipped} product(s) already present at these versions were not re-fetched");
+    }
+    let not_performed: Vec<&str> = spec
+        .get("skipped_version_changes")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !not_performed.is_empty() {
+        println!(
+            "{} product(s) present under a different version were NOT performed:",
+            not_performed.len()
+        );
+        for product in &not_performed {
+            println!("  {product}");
+        }
+    }
     std::fs::create_dir_all(&install_dir).map_err(|e| e.to_string())?;
     let cache = wm_core::config::artifacts_dir().join(&sandbox);
 
@@ -936,6 +1581,28 @@ pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
     }
     println!("{summary}");
 
+    // Keep the registry's component list honest: the installation just changed,
+    // and a snapshot that still describes the state before it is worse than
+    // none. Failing to update it must not fail the install, which succeeded.
+    if let Some(name) = spec.get("register").and_then(Value::as_str) {
+        match wm_core::registry::get(name) {
+            Ok(mut record) => {
+                record.last_job = std::env::var("WM_JOB_DIR").ok().and_then(|d| {
+                    PathBuf::from(d)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                });
+                record.release.get_or_insert(release_wanted.clone());
+                record.platform.get_or_insert(platform.clone());
+                match record.refresh().and_then(|_| record.save()) {
+                    Ok(()) => println!("refreshed the registry record for {name}"),
+                    Err(e) => println!("note: cannot refresh the registry record for {name}: {e}"),
+                }
+            }
+            Err(e) => println!("note: cannot read the registry record for {name}: {e}"),
+        }
+    }
+
     let panels: Vec<&String> = products
         .iter()
         .filter(|p| !tree.panels_for(p).is_empty())
@@ -964,6 +1631,7 @@ pub fn database_plan() -> Tool {
             "type": "object",
             "required": ["wm_home"],
             "properties": {
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
                 "wm_home": { "type": "string", "description": "Installation to inspect." },
                 "database": { "type": "string", "description": "postgresql, oracle, sqlserver, db2, mysql or sybase (default postgresql)." },
                 "components": { "type": "array", "items": { "type": "string" }, "description": "Component names; default every component found." }
@@ -1022,6 +1690,7 @@ pub fn database_configure() -> Tool {
             "type": "object",
             "required": ["wm_home", "components", "database", "url", "user", "password"],
             "properties": {
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
                 "wm_home": { "type": "string", "description": "Installation whose configurator to run." },
                 "components": { "type": "array", "items": { "type": "string" }, "description": "Component names, e.g. TradingNetworks. Prerequisites are added automatically." },
                 "database": { "type": "string", "description": "postgresql, oracle, sqlserver, db2, mysql or sybase." },
@@ -1147,6 +1816,7 @@ pub fn profile_provision() -> Tool {
             "type": "object",
             "required": ["wm_home", "profile", "roots"],
             "properties": {
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
                 "wm_home": { "type": "string", "description": "Installation whose director and repositories to use." },
                 "profile": { "type": "string", "description": "Profile name, e.g. SPM." },
                 "destination": { "type": "string", "description": "Where to create it; defaults to <wm_home>/profiles/<profile>." },
@@ -1156,7 +1826,6 @@ pub fn profile_provision() -> Tool {
                 "arch": { "type": "string", "description": "Default x86_64." },
                 "apply": { "type": "boolean", "description": "Set true to run; otherwise a dry run." }
             }
-                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
         }),
         Box::new(|args| {
             let home = required_home(args)?;
@@ -1215,30 +1884,3 @@ pub fn profile_provision() -> Tool {
         }),
     )
 }
-                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
-                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
-    // Keep the registry's component list honest: the installation just changed,
-    // and a snapshot that still describes the state before it is worse than
-    // none. Failing to update it must not fail the install, which succeeded.
-    if let Some(name) = spec.get("register").and_then(Value::as_str) {
-        match wm_core::registry::get(name) {
-            Ok(mut record) => {
-                record.last_job = std::env::var("WM_JOB_DIR").ok().and_then(|d| {
-                    PathBuf::from(d)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                });
-                record.release.get_or_insert(release_wanted.clone());
-                record.platform.get_or_insert(platform.clone());
-                match record.refresh().and_then(|_| record.save()) {
-                    Ok(()) => println!("refreshed the registry record for {name}"),
-                    Err(e) => println!("note: cannot refresh the registry record for {name}: {e}"),
-                }
-            }
-            Err(e) => println!("note: cannot read the registry record for {name}: {e}"),
-        }
-    }
-
-                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
-                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
-                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },

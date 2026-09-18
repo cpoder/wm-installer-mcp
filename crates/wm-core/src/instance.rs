@@ -757,6 +757,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_package_without_a_manifest_does_not_count_as_present() {
+        let root = std::env::temp_dir().join(format!("wm-pkgs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = root.join("IntegrationServer").join("packages");
+        let inst = root
+            .join("IntegrationServer")
+            .join("instances")
+            .join("default")
+            .join("packages");
+        for (dir, packages) in [
+            (&repo, vec!["WmDeployer", "WmRoot", "WmTN"]),
+            (&inst, vec!["WmRoot"]),
+        ] {
+            for name in packages {
+                fs::create_dir_all(dir.join(name)).unwrap();
+                fs::write(dir.join(name).join("manifest.v3"), "<Values/>").unwrap();
+            }
+        }
+        // The shape the failure actually takes: the copy created the directory
+        // and stopped. Integration Server will not load this, so neither may we
+        // report it as present.
+        fs::create_dir_all(inst.join("WmDeployer").join("replicate")).unwrap();
+
+        let missing = packages_not_in_instance(&root, "default");
+        assert_eq!(missing, vec!["WmDeployer", "WmTN"]);
+        assert!(packages_not_in_instance(&root, "no-such-instance").len() == 3);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn update_builds_the_command_the_shipped_target_documents() {
+        // A fake installation: is_instance.sh and the product's own JVM are the
+        // two things `update` refuses to proceed without.
+        let root = std::env::temp_dir().join(format!("wm-update-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let instances = root.join("IntegrationServer").join("instances");
+        fs::create_dir_all(&instances).unwrap();
+        fs::write(instances.join("is_instance.sh"), "#!/bin/sh\n").unwrap();
+        let jvm = root.join("jvm").join("jvm").join("bin");
+        fs::create_dir_all(&jvm).unwrap();
+        fs::write(jvm.join("java"), "").unwrap();
+
+        let invocation = ant::update(
+            &root,
+            "default",
+            &ant::UpdateOptions {
+                packages: vec!["WmDeployer".into(), "WmDeployerResource".into()],
+                db_type: Some("POSTGRESQL".into()),
+                db_password: Some("s3cret".into()),
+                ..ant::UpdateOptions::default()
+            },
+        )
+        .expect("invocation");
+        assert_eq!(
+            invocation.args,
+            vec![
+                "update",
+                "-Dinstance.name=default",
+                "-Ddb.type=POSTGRESQL",
+                "-Ddb.password=s3cret",
+                "-Dpackage.list=WmDeployer,WmDeployerResource",
+            ]
+        );
+        // The rendered form is what a dry run shows a user; the password is not
+        // part of it.
+        let shown = invocation.display();
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains("-Ddb.password=******"), "{shown}");
+
+        // `create` settles ports, the licence and the administrator password,
+        // and the update target does not accept them — so nothing here can pass
+        // them by mistake.
+        assert!(!invocation.args.iter().any(|a| a.contains("primary.port")));
+
+        // No JVM, no run: the script would fail later and less clearly.
+        let _ = fs::remove_dir_all(root.join("jvm"));
+        assert!(ant::update(&root, "default", &ant::UpdateOptions::default()).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn names_that_would_break_paths_are_refused() {
         assert!(validate_name("default").is_ok());
         assert!(validate_name("is_2").is_ok());
@@ -874,6 +955,46 @@ mod tests {
     }
 }
 
+/// What a package repository holds that one instance does not.
+///
+/// `IntegrationServer/packages` is the repository a product installs into;
+/// `IntegrationServer/instances/<name>/packages` is what a running instance
+/// loads. Installing a product that ships packages fills the first and leaves
+/// the second alone, and nothing says so — the installation is complete, the
+/// files are on disk, and the server answers `Unknown package` for a package it
+/// visibly contains. `is_instance.sh update` is the step that closes the gap.
+///
+/// A package counts as present only when it carries a `manifest.v3`, which is
+/// what Integration Server reads to know a package at all. A directory left by a
+/// half-finished copy — one that holds only `replicate/`, say — is a package the
+/// server will not load, and reporting it as present would hide exactly the
+/// situation this exists to surface.
+///
+/// The result is a difference, not a fault: non-core packages belong in an
+/// instance only when someone put them there.
+pub fn packages_not_in_instance(wm_home: &Path, instance: &str) -> Vec<String> {
+    let root = wm_home.join("IntegrationServer");
+    let installed = loadable_packages(&root.join("packages"));
+    let in_instance = loadable_packages(&root.join("instances").join(instance).join("packages"));
+    installed
+        .into_iter()
+        .filter(|name| !in_instance.contains(name))
+        .collect()
+}
+
+/// Package names under `dir` that Integration Server would load.
+fn loadable_packages(dir: &Path) -> std::collections::BTreeSet<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return std::collections::BTreeSet::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("manifest.v3").is_file())
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect()
+}
+
 /// Create an instance with the product's own Ant script.
 ///
 /// `IntegrationServer/instances/is_instance.sh` ships with the product, along
@@ -945,16 +1066,7 @@ pub mod ant {
 
     /// Build the invocation that creates `name`.
     pub fn create(wm_home: &Path, name: &str, options: &Options) -> Result<Invocation> {
-        let program = wm_home
-            .join("IntegrationServer")
-            .join("instances")
-            .join("is_instance.sh");
-        if !program.is_file() {
-            return Err(Error::Malformed(format!(
-                "{} is missing; Integration Server is not installed here",
-                program.display()
-            )));
-        }
+        let program = script(wm_home)?;
         let mut args = vec!["create".to_string(), format!("-Dinstance.name={name}")];
         let mut push = |key: &str, value: Option<String>| {
             if let Some(value) = value {
@@ -979,6 +1091,30 @@ pub mod ant {
         if !options.packages.is_empty() {
             args.push(format!("-Dpackage.list={}", options.packages.join(",")));
         }
+        Ok(Invocation {
+            program,
+            args,
+            java_home: java_home(wm_home)?,
+        })
+    }
+
+    /// The shipped script, or an error naming what is not installed.
+    fn script(wm_home: &Path) -> Result<PathBuf> {
+        let program = wm_home
+            .join("IntegrationServer")
+            .join("instances")
+            .join("is_instance.sh");
+        if !program.is_file() {
+            return Err(Error::Malformed(format!(
+                "{} is missing; Integration Server is not installed here",
+                program.display()
+            )));
+        }
+        Ok(program)
+    }
+
+    /// The product's own JVM, which the script wants and will not run without.
+    fn java_home(wm_home: &Path) -> Result<PathBuf> {
         let java_home = wm_home.join("jvm").join("jvm");
         if !java_home.join("bin").join("java").is_file() {
             return Err(Error::Malformed(format!(
@@ -986,10 +1122,62 @@ pub mod ant {
                 java_home.display()
             )));
         }
+        Ok(java_home)
+    }
+
+    /// Settings the `update` target accepts.
+    ///
+    /// A subset of [`Options`], because `update` changes an instance that
+    /// already exists: ports, the bind address, the licence and the
+    /// administrator password were settled at creation and the target does not
+    /// take them.
+    #[derive(Debug, Clone, Default)]
+    pub struct UpdateOptions {
+        /// Packages to place in the instance, or [`ALL_PACKAGES`].
+        pub packages: Vec<String>,
+        pub db_type: Option<String>,
+        pub db_alias: Option<String>,
+        pub db_url: Option<String>,
+        pub db_username: Option<String>,
+        pub db_password: Option<String>,
+    }
+
+    /// The value `package.list` takes to mean every non-core package.
+    ///
+    /// Documented by the script's own `help`, and not a list this code should
+    /// expand itself: what counts as non-core is `is_core_packages.properties`'
+    /// business and changes with the release.
+    pub const ALL_PACKAGES: &str = "all";
+
+    /// Build the invocation that updates `name`.
+    ///
+    /// Installing a product that ships Integration Server packages lays them
+    /// down under `IntegrationServer/packages`, which is the repository — not
+    /// under the instance that runs them. Until this target copies them across,
+    /// the instance answers `Unknown package` for something the installation
+    /// plainly contains, and the installation looks finished while being
+    /// inoperative. There is no way to reach this step from the product's other
+    /// tooling, and nothing announces that it is required.
+    pub fn update(wm_home: &Path, name: &str, options: &UpdateOptions) -> Result<Invocation> {
+        let program = script(wm_home)?;
+        let mut args = vec!["update".to_string(), format!("-Dinstance.name={name}")];
+        let mut push = |key: &str, value: Option<String>| {
+            if let Some(value) = value {
+                args.push(format!("-D{key}={value}"));
+            }
+        };
+        push("db.type", options.db_type.clone());
+        push("db.alias", options.db_alias.clone());
+        push("db.url", options.db_url.clone());
+        push("db.username", options.db_username.clone());
+        push("db.password", options.db_password.clone());
+        if !options.packages.is_empty() {
+            args.push(format!("-Dpackage.list={}", options.packages.join(",")));
+        }
         Ok(Invocation {
             program,
             args,
-            java_home,
+            java_home: java_home(wm_home)?,
         })
     }
 

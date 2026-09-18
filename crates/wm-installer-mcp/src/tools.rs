@@ -76,8 +76,10 @@ fn wm_home(args: &Value) -> Result<PathBuf, ToolError> {
                 "no installation named: pass wm_home (a path or a registered name) or install \
                  (a registered name), set $WM_HOME, or make one the default with config_set \
                  setting=install. install_list shows what is registered.",
+        .tool(crate::native::instance_update())
             )
         })?;
+        .tool(crate::native::install_verify())
     crate::manage::resolve_home(&given)
 }
 

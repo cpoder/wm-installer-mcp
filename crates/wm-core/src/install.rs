@@ -18,13 +18,15 @@
 //! products declare panels so the gap is visible before anything is written,
 //! rather than discovered on a server that does not start.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::catalog::ProductPath;
+use crate::inventory::Inventory;
 use crate::sdc::{self, Session};
 use crate::tree::{Artifact, ProductTree};
 use crate::{Error, Result};
@@ -75,6 +77,487 @@ pub struct ProductPanels {
     pub product: String,
     /// Panel names declared by the product.
     pub panels: Vec<String>,
+}
+
+/// A declared path that is not where the manifest put it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Absent {
+    /// The path, as the manifest declares it.
+    pub path: String,
+    /// A file in the same directory that supersedes it, when there is one.
+    ///
+    /// `Some` means a fix replaced it: `com.webmethods.tps.apache.ant.feature_
+    /// 12.1.0.0000-0280.jar` is gone and `…_12.1.0.0001-0731.jar` is beside it.
+    /// That is the Update Manager doing its job, not damage.
+    pub superseded_by: Option<String>,
+}
+
+/// One artifact's manifest, checked against the disk.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactCheck {
+    /// The `.contents` basename, which is the artifact's name.
+    pub artifact: String,
+    /// The product path the manifest names.
+    pub product: Option<String>,
+    /// Version the manifest records.
+    pub version: Option<String>,
+    /// How many paths it lists.
+    pub declared: usize,
+    /// Directory the paths were resolved against, relative to the
+    /// installation. Empty for the usual case of the installation root.
+    pub base: String,
+    /// Declared paths that are not there.
+    pub absent: Vec<Absent>,
+    /// Of those, how many a newer file supersedes.
+    pub superseded: usize,
+    /// Of those, how many nothing accounts for.
+    pub unexplained: usize,
+    /// Whether not one declared path is present.
+    pub never_written: bool,
+}
+
+/// Everything an installation claims, checked against what it has.
+#[derive(Debug, Clone, Serialize)]
+pub struct Verification {
+    /// The installation.
+    pub wm_home: PathBuf,
+    /// Manifests read.
+    pub artifacts: usize,
+    /// Paths declared across all of them.
+    pub declared: usize,
+    /// Declared paths that are not there, for whatever reason.
+    pub absent: usize,
+    /// Of those, superseded by a newer file in the same directory.
+    pub superseded: usize,
+    /// Of those, unaccounted for.
+    pub unexplained: usize,
+    /// Artifacts of which nothing at all was written. The signal that matters.
+    pub never_written: Vec<ArtifactCheck>,
+    /// Artifacts with absences nothing accounts for, worst first.
+    pub incomplete: Vec<ArtifactCheck>,
+    /// Manifests that could not be read at all.
+    pub unreadable: Vec<String>,
+}
+
+impl Verification {
+    /// Whether anything was found that an applied fix does not explain.
+    pub fn is_sound(&self) -> bool {
+        self.never_written.is_empty() && self.unexplained == 0 && self.unreadable.is_empty()
+    }
+}
+
+/// Check an installation against the manifests it carries.
+///
+/// A native install leaves `install/bms/<artifact>.contents` listing every path
+/// it wrote, and the shipped installer does the same. That is a complete
+/// statement of what the installation contained *when it was installed*, and
+/// until now nothing read it back: a plan trusted `install/products/*.prop` —
+/// which says a product is *claimed* — and no tool could tell a finished install
+/// from one whose files a failed run had never written.
+///
+/// # Why a declared path being absent is usually correct
+///
+/// Applying a fix deletes files and puts newer ones in their place, and no one
+/// rewrites the manifest afterwards. On the first real installation this was run
+/// against, every one of the sampled absences was of that kind:
+/// `com.webmethods.osgi.agent.profile_12.1.0.0000-0497` gone with
+/// `…_12.1.0.0002-0579` beside it, `org-eclipse-jgit-ssh-jsch-6.3.0.jar` gone
+/// with `-7.4.0.jar` beside it. Reporting those as faults would tell an operator
+/// that a correctly patched installation is broken in sixteen places.
+///
+/// So an absence is classified rather than counted. A file that a same-named,
+/// differently-versioned neighbour supersedes is reported as superseded. Only
+/// two things are ever called wrong: an artifact of which *nothing* was written,
+/// and an absence with no replacement to account for it.
+///
+/// Reading is all this does. It opens no archive and contacts nothing, so it
+/// works on a stopped installation with no credentials. It checks presence, not
+/// content: the manifests carry no sizes or digests, so a truncated file passes.
+pub fn verify(wm_home: &Path, only: Option<&str>) -> Result<Verification> {
+    let dir = wm_home.join("install").join("bms");
+    let entries = fs::read_dir(&dir).map_err(|e| Error::io(&dir, e))?;
+    let mut incomplete: Vec<ArtifactCheck> = Vec::new();
+    let mut never_written: Vec<ArtifactCheck> = Vec::new();
+    let mut unreadable = Vec::new();
+    let (mut artifacts, mut declared_total) = (0usize, 0usize);
+    let (mut absent_total, mut superseded_total, mut unexplained_total) = (0usize, 0usize, 0usize);
+
+    let needle = only.map(str::to_lowercase);
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.extension().is_none_or(|e| e != "contents") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Ok(text) = fs::read_to_string(&path) else {
+            unreadable.push(name);
+            continue;
+        };
+        let manifest = Manifest::parse(&text);
+        // Filter on the manifest as well as the filename: a caller narrowing to
+        // "Deployer" means the product, and the artifact carrying it is called
+        // BM_Deployer-ALL-Any.
+        if let Some(needle) = &needle {
+            let hit = name.to_lowercase().contains(needle)
+                || manifest
+                    .product
+                    .as_ref()
+                    .is_some_and(|p| p.to_lowercase().contains(needle));
+            if !hit {
+                continue;
+            }
+        }
+        artifacts += 1;
+        declared_total += manifest.files.len();
+
+        let base = resolve_base(wm_home, &manifest.files);
+        let root = wm_home.join(&base);
+        let absent: Vec<Absent> = manifest
+            .files
+            .iter()
+            .filter(|relative| !root.join(relative).exists())
+            .map(|relative| Absent {
+                superseded_by: superseding_neighbour(&root, relative),
+                path: relative.clone(),
+            })
+            .collect();
+        let superseded = absent.iter().filter(|a| a.superseded_by.is_some()).count();
+        let unexplained = absent.len() - superseded;
+        absent_total += absent.len();
+        superseded_total += superseded;
+        unexplained_total += unexplained;
+
+        let check = ArtifactCheck {
+            artifact: name,
+            product: manifest.product,
+            version: manifest.version,
+            declared: manifest.files.len(),
+            base: base.to_string_lossy().into_owned(),
+            // Nothing present *and* nothing accounting for it. A small artifact
+            // whose every file a fix replaced is absent in full and perfectly
+            // healthy, so counting absences alone would condemn it.
+            never_written: !manifest.files.is_empty() && unexplained == manifest.files.len(),
+            superseded,
+            unexplained,
+            absent,
+        };
+        if check.never_written {
+            never_written.push(check);
+        } else if unexplained > 0 {
+            incomplete.push(check);
+        }
+    }
+    let worst_first = |a: &ArtifactCheck, b: &ArtifactCheck| {
+        b.unexplained
+            .cmp(&a.unexplained)
+            .then_with(|| a.artifact.cmp(&b.artifact))
+    };
+    incomplete.sort_by(worst_first);
+    never_written.sort_by(worst_first);
+    unreadable.sort();
+    Ok(Verification {
+        wm_home: wm_home.to_path_buf(),
+        artifacts,
+        declared: declared_total,
+        absent: absent_total,
+        superseded: superseded_total,
+        unexplained: unexplained_total,
+        never_written,
+        incomplete,
+        unreadable,
+    })
+}
+
+/// Directories a manifest's paths may be relative to.
+///
+/// Almost every manifest is relative to the installation root. A few are not:
+/// `BM_WmSAP-ALL-Any#2` declares `packages/WmSAP/…` for files that are at
+/// `IntegrationServer/packages/WmSAP/…`, and nothing in the manifest says so.
+/// Rather than assume, the base is chosen by which one the files are actually
+/// under.
+const CANDIDATE_BASES: &[&str] = &["", "IntegrationServer"];
+
+/// Pick the base directory `files` are relative to, on the evidence.
+///
+/// Sampled rather than exhaustive: a manifest can list several thousand paths
+/// and the answer is the same after fifty.
+fn resolve_base(wm_home: &Path, files: &[String]) -> PathBuf {
+    let sample: Vec<&String> = files.iter().take(50).collect();
+    if sample.is_empty() {
+        return PathBuf::new();
+    }
+    let hits = |base: &str| {
+        let root = wm_home.join(base);
+        sample
+            .iter()
+            .filter(|relative| root.join(relative.as_str()).exists())
+            .count()
+    };
+    let best = CANDIDATE_BASES
+        .iter()
+        .max_by_key(|base| hits(base))
+        .copied()
+        .unwrap_or("");
+    // Only move off the installation root when the evidence is clear; a
+    // manifest of which nothing was written scores zero everywhere and must
+    // keep the root, or its report would name a directory it never used.
+    if hits(best) > hits("") {
+        PathBuf::from(best)
+    } else {
+        PathBuf::new()
+    }
+}
+
+/// A file beside `relative` that looks like a newer version of it.
+///
+/// Fix artifacts are versioned in their names — `…_12.1.0.0000-0497`,
+/// `…-6.3.0.jar` — so two names match when they agree on everything but the
+/// version: the same stem before it, and the same tail after it. The tail is
+/// what keeps a `.jar` from being superseded by a `.txt` that shares a prefix,
+/// and comparing file extensions instead does not work, because a version
+/// containing dots *is* the extension as far as any split on `.` can tell.
+fn superseding_neighbour(root: &Path, relative: &str) -> Option<String> {
+    let path = root.join(relative);
+    let directory = path.parent()?;
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let stem = version_stem(&name)?;
+    let tail = version_tail(&name, stem);
+    fs::read_dir(directory)
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|candidate| {
+            candidate != &name
+                && version_stem(candidate)
+                    .is_some_and(|other| other == stem && version_tail(candidate, other) == tail)
+        })
+}
+
+/// What follows the version in a name whose stem is `stem`.
+///
+/// `…profile_12.1.0.0000-0497` yields `""` and `mina-core-2.2.5.jar` yields
+/// `jar`: everything version-shaped is dropped, and whatever the name ends with
+/// remains.
+fn version_tail<'a>(name: &'a str, stem: &str) -> &'a str {
+    name[stem.len()..].trim_start_matches(|c: char| c.is_ascii_digit() || "._-".contains(c))
+}
+
+/// The part of a file name before its version, or `None` if it has none.
+///
+/// Splits at the **first** `_` or `-` followed by a digit, because a version is
+/// several such segments and only the first begins it:
+/// `com.webmethods.osgi.agent.profile_12.1.0.0000-0497` yields
+/// `com.webmethods.osgi.agent.profile`, which is what it shares with the
+/// `…_12.1.0.0002-0579` a fix left in its place. Cutting at the last one instead
+/// yields `…profile_12.1.0.0000`, which the replacement cannot match — and every
+/// replaced file is then reported as unexplained.
+///
+/// A name with no such separator has no version to differ in, so it cannot be
+/// superseded.
+fn version_stem(name: &str) -> Option<&str> {
+    let bytes = name.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .find(|(i, byte)| {
+            (**byte == b'_' || **byte == b'-') && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+        })
+        .map(|(i, _)| &name[..i])
+}
+
+/// A parsed `.contents` file.
+///
+/// Two shapes are in the wild, and an installation of any age carries both. The
+/// shipped installer writes `name=`, `version=` and `timestamp=` headers with no
+/// blank line, then one `<octal mode> <path>` line per file:
+///
+/// ```text
+/// name=e2ei/11/IS_12.1.0.0.938/integrationServer/PIECore/…/BM_…
+/// version=12.1.0.0.938
+/// timestamp=1776417008
+/// 0755 IntegrationServer/packages/WmRoot/assets.json
+/// ```
+///
+/// A native install writes the headers, a blank line, then bare paths. Reading
+/// only the second shape reports every file of the first as missing — 22 745 of
+/// them on the installation this was first run against, none of them absent.
+struct Manifest {
+    product: Option<String>,
+    version: Option<String>,
+    files: Vec<String>,
+}
+
+impl Manifest {
+    fn parse(text: &str) -> Self {
+        let mut product = None;
+        let mut version = None;
+        let mut files = Vec::new();
+        // Headers only count until the first line that is not one. After that a
+        // file may legitimately be named `version=something`.
+        let mut in_headers = true;
+        for line in text.lines() {
+            if in_headers {
+                if line.trim().is_empty() {
+                    in_headers = false;
+                    continue;
+                }
+                if let Some(value) = line.strip_prefix("name=") {
+                    product = Some(value.trim().to_string());
+                    continue;
+                }
+                if let Some(value) = line.strip_prefix("version=") {
+                    version = Some(value.trim().to_string());
+                    continue;
+                }
+                if line.starts_with("timestamp=") {
+                    continue;
+                }
+                in_headers = false;
+            }
+            let path = strip_mode(line.trim_end());
+            if !path.trim().is_empty() {
+                files.push(path.to_string());
+            }
+        }
+        Self {
+            product,
+            version,
+            files,
+        }
+    }
+}
+
+/// Drop the leading `0755 ` the shipped installer records, if there is one.
+///
+/// Split on the first space only: a recorded path may contain spaces, and the
+/// mode never does.
+fn strip_mode(line: &str) -> &str {
+    let Some((mode, rest)) = line.split_once(' ') else {
+        return line;
+    };
+    let is_mode = mode.len() == 4 && mode.bytes().all(|b| (b'0'..=b'7').contains(&b));
+    if is_mode {
+        rest
+    } else {
+        line
+    }
+}
+
+/// What a selection means for an installation that already exists.
+///
+/// The native install path unpacked every artifact of the closure
+/// unconditionally. Into an empty directory that is correct. Into an existing
+/// installation it is not: a product reinstalled at its base version overwrites
+/// files that Update Manager has since patched, so the installation silently
+/// loses fix level — no error, no entry in a log, and nothing that would show up
+/// until something misbehaves months later.
+///
+/// Splitting the selection against what is on disk is what makes the difference
+/// visible. `install/products/*.prop` already carries the exact versioned path
+/// of everything installed, which is the same identifier the catalogue uses, so
+/// the comparison is an equality and not a heuristic.
+///
+/// Two things it deliberately does not claim.
+///
+/// That a matching version means matching *files*: a `.prop` records the version
+/// a product was installed at, and a product Update Manager has since patched
+/// still reports that same version — the fix level lives in `updateReadmes`,
+/// which [`Inventory`] reads separately. Matching versions therefore only
+/// justify leaving a product alone, which is what happens; they never justify
+/// writing over it.
+///
+/// And that a `.prop` means the product is *complete*. Nothing here opens a
+/// single file: a product counts as present because the installation says so.
+/// The one partial run measured — the shipped installer failing part-way on
+/// 2026-09-18 — argues the record is trustworthy rather than the reverse, since
+/// it wrote a `.prop` for each of the three products it had actually placed and
+/// for none of the thirteen it had not. What is untested is the case where the
+/// record outruns the files. Verifying that every path an
+/// `install/bms/*.contents` names is present is a different question, and not
+/// one this answers.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Delta {
+    /// Selected products already present at exactly this version. No work.
+    pub already_installed: Vec<String>,
+    /// Selected products present at a *different* version — the dangerous case.
+    pub version_changes: Vec<VersionChange>,
+    /// Selected products not present at all. This is the actual install.
+    pub to_install: Vec<String>,
+}
+
+/// A selected product the installation already carries under another version.
+#[derive(Debug, Clone, Serialize)]
+pub struct VersionChange {
+    /// Versioned path as the catalogue gives it.
+    pub product: String,
+    /// Versioned path as the installation carries it.
+    pub installed: String,
+    /// Component name, the two paths' common identity.
+    pub component: String,
+    /// Version on disk.
+    pub installed_version: String,
+    /// Version the catalogue would lay down.
+    pub catalog_version: String,
+}
+
+impl Delta {
+    /// Whether anything at all would be written.
+    pub fn is_empty(&self) -> bool {
+        self.to_install.is_empty() && self.version_changes.is_empty()
+    }
+
+    /// Everything that would be written: the additions, plus the version
+    /// changes, which are only performed when the caller forces them.
+    pub fn forced(&self) -> Vec<String> {
+        let mut all = self.to_install.clone();
+        all.extend(self.version_changes.iter().map(|c| c.product.clone()));
+        all.sort();
+        all
+    }
+}
+
+/// Split `products` against what `installed` already carries.
+///
+/// Identity is `(group, component, product code)` — the version is deliberately
+/// not part of it, because telling a reinstall from an upgrade is the entire
+/// point. An installation with no products at all yields everything to install,
+/// which is the fresh case and needs no special handling by the caller.
+pub fn delta(products: &[String], installed: &Inventory) -> Delta {
+    // Exact paths first: the cheap answer for the common case.
+    let present: BTreeSet<&str> = installed.products.iter().map(|p| p.path.as_str()).collect();
+    // Then by identity, for products carried at some other version.
+    let by_identity: BTreeMap<(&str, &str, &str), &crate::inventory::InstalledProduct> = installed
+        .products
+        .iter()
+        .map(|p| ((p.group.as_str(), p.component.as_str(), p.code.as_str()), p))
+        .collect();
+
+    let mut delta = Delta::default();
+    for product in products {
+        if present.contains(product.as_str()) {
+            delta.already_installed.push(product.clone());
+            continue;
+        }
+        let Ok(path) = ProductPath::parse(product) else {
+            // Not a well-formed versioned path: nothing on disk can match it by
+            // identity, so treat it as new rather than dropping it.
+            delta.to_install.push(product.clone());
+            continue;
+        };
+        match by_identity.get(&(path.group.as_str(), path.component.as_str(), path.code())) {
+            Some(existing) => delta.version_changes.push(VersionChange {
+                product: product.clone(),
+                installed: existing.path.clone(),
+                component: path.component.clone(),
+                installed_version: existing.version.clone(),
+                catalog_version: path.version().to_string(),
+            }),
+            None => delta.to_install.push(product.clone()),
+        }
+    }
+    delta
 }
 
 /// Build a plan for `products` against `tree`.
@@ -493,6 +976,323 @@ pub fn installed_products(install_dir: &Path) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An installation carrying exactly `paths`.
+    fn installed(paths: &[&str]) -> Inventory {
+        Inventory {
+            wm_home: PathBuf::from("/opt/webmethods"),
+            products: paths
+                .iter()
+                .map(|raw| {
+                    let path = ProductPath::parse(raw).expect("test path");
+                    crate::inventory::InstalledProduct {
+                        component: path.component.clone(),
+                        group: path.group.clone(),
+                        code: path.code().to_string(),
+                        version: path.version().to_string(),
+                        path: raw.to_string(),
+                    }
+                })
+                .collect(),
+            runtimes: Vec::new(),
+            fixes: Vec::new(),
+        }
+    }
+
+    const IS_938: &str = "e2ei/11/IS_12.1.0.0.938/integrationServer/integrationServer";
+    const IS_940: &str = "e2ei/11/IS_12.1.0.0.940/integrationServer/integrationServer";
+    const DEPLOYER: &str = "e2ei/11/DEP_12.1.0.0.42/Deployer/Deployer";
+
+    /// An installation carrying one manifest, with `present` of its paths on disk.
+    fn with_manifest(label: &str, declared: &[&str], present: &[&str]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "wm-verify-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let bms = root.join("install").join("bms");
+        fs::create_dir_all(&bms).unwrap();
+        let mut text = String::from(
+            "name=e2ei/11/DEP_12.1.0.0.1560/IntegrationServer/Deployer/x/BM_Deployer-ALL-Any\n\
+             version=12.1.0.0.1560\n\n",
+        );
+        for path in declared {
+            text.push_str(path);
+            text.push('\n');
+        }
+        fs::write(bms.join("BM_Deployer-ALL-Any.contents"), text).unwrap();
+        for path in present {
+            let file = root.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, "x").unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn a_complete_installation_verifies() {
+        let files = ["IntegrationServer/packages/WmDeployer/bin/Deployer.sh"];
+        let root = with_manifest("ok", &files, &files);
+        let report = verify(&root, None).unwrap();
+        assert!(report.is_sound());
+        assert_eq!(
+            (report.artifacts, report.declared, report.absent),
+            (1, 1, 0)
+        );
+        assert!(report.incomplete.is_empty() && report.never_written.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_absence_is_named_with_the_product_that_claims_it() {
+        let declared = [
+            "IntegrationServer/packages/WmDeployer/bin/Deployer.sh",
+            "IntegrationServer/packages/WmDeployer/code/Gone.class",
+        ];
+        let root = with_manifest("gap", &declared, &declared[..1]);
+        let report = verify(&root, None).unwrap();
+        assert!(!report.is_sound());
+        assert_eq!((report.absent, report.unexplained), (1, 1));
+        let [check] = &report.incomplete[..] else {
+            panic!("expected one incomplete artifact");
+        };
+        assert_eq!(check.artifact, "BM_Deployer-ALL-Any");
+        assert_eq!(check.declared, 2);
+        assert_eq!(
+            check
+                .absent
+                .iter()
+                .map(|a| a.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![declared[1]]
+        );
+        assert!(check.product.as_deref().is_some_and(|p| p.contains("DEP_")));
+        assert_eq!(check.version.as_deref(), Some("12.1.0.0.1560"));
+        // Something was written, so it is not the conclusive finding.
+        assert!(!check.never_written);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_filter_matches_the_product_and_not_only_the_artifact_name() {
+        let files = ["IntegrationServer/packages/WmDeployer/bin/Deployer.sh"];
+        let root = with_manifest("filter", &files, &files);
+        // `Deployer` is in both; `DEP_12.1` is only in the product path, which
+        // is what a caller reading a plan would have to hand.
+        assert_eq!(verify(&root, Some("dep_12.1")).unwrap().artifacts, 1);
+        assert_eq!(verify(&root, Some("deployer")).unwrap().artifacts, 1);
+        assert_eq!(verify(&root, Some("trading")).unwrap().artifacts, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_a_fix_replaced_is_not_reported_as_a_fault() {
+        // The exact shape measured on a real installation: the manifest names
+        // the version installed, a fix left a newer one in its place.
+        let declared =
+            ["common/runtime/bundles/x/com.webmethods.osgi.agent.profile_12.1.0.0000-0497"];
+        let root = with_manifest("fix", &declared, &[]);
+        let bundles = root.join("common/runtime/bundles/x");
+        fs::create_dir_all(&bundles).unwrap();
+        fs::write(
+            bundles.join("com.webmethods.osgi.agent.profile_12.1.0.0002-0579"),
+            "x",
+        )
+        .unwrap();
+        let report = verify(&root, None).unwrap();
+        assert_eq!(
+            (report.absent, report.superseded, report.unexplained),
+            (1, 1, 0)
+        );
+        assert!(
+            report.is_sound(),
+            "a patched installation must read as sound"
+        );
+        assert!(report.incomplete.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_artifact_entirely_replaced_by_a_fix_is_not_called_never_written() {
+        // One declared file, gone, with its replacement beside it. Counting
+        // absences alone makes this "nothing was written", which is the
+        // strongest thing the report can say and would be wrong.
+        let declared = ["common/runtime/bundles/y/com.webmethods.tps.feature_12.1.0.0000-0280.jar"];
+        let root = with_manifest("whole", &declared, &[]);
+        let bundles = root.join("common/runtime/bundles/y");
+        fs::create_dir_all(&bundles).unwrap();
+        fs::write(
+            bundles.join("com.webmethods.tps.feature_12.1.0.0001-0731.jar"),
+            "x",
+        )
+        .unwrap();
+        let report = verify(&root, None).unwrap();
+        assert!(report.never_written.is_empty(), "{report:?}");
+        assert!(report.is_sound());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_artifact_that_was_never_written_is_the_conclusive_finding() {
+        let declared = [
+            "IntegrationServer/packages/WmDeployer/bin/Deployer.sh",
+            "IntegrationServer/packages/WmDeployer/code/Gone.class",
+        ];
+        let root = with_manifest("never", &declared, &[]);
+        let report = verify(&root, None).unwrap();
+        assert!(!report.is_sound());
+        let [check] = &report.never_written[..] else {
+            panic!(
+                "expected one never-written artifact: {:?}",
+                report.never_written
+            );
+        };
+        assert_eq!(check.declared, 2);
+        assert_eq!(check.unexplained, 2);
+        // It belongs in one list, not both.
+        assert!(report.incomplete.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_version_stem_cuts_at_the_start_of_the_version() {
+        // Cutting at the last separator instead reports every replaced file as
+        // unexplained, which is how this was first got wrong.
+        assert_eq!(
+            version_stem("com.webmethods.osgi.agent.profile_12.1.0.0000-0497"),
+            Some("com.webmethods.osgi.agent.profile")
+        );
+        assert_eq!(version_stem("mina-core-2.2.5.jar"), Some("mina-core"));
+        assert_eq!(
+            version_stem("org-eclipse-jgit-ssh-jsch-6.3.0.jar"),
+            Some("org-eclipse-jgit-ssh-jsch")
+        );
+        // Nothing version-shaped: it cannot be superseded, so it has no stem.
+        assert_eq!(version_stem("Help_Basics.html"), None);
+        assert_eq!(version_stem("assets.json"), None);
+    }
+
+    #[test]
+    fn a_base_directory_is_chosen_on_the_evidence() {
+        // One real manifest declares `packages/WmSAP/…` for files that live
+        // under `IntegrationServer/`, and says so nowhere.
+        let declared = ["packages/WmSAP/code/Adapter.class"];
+        let root = with_manifest("base", &declared, &[]);
+        let under = root.join("IntegrationServer/packages/WmSAP/code");
+        fs::create_dir_all(&under).unwrap();
+        fs::write(under.join("Adapter.class"), "x").unwrap();
+        let report = verify(&root, None).unwrap();
+        assert!(report.is_sound(), "{report:?}");
+        assert_eq!(report.absent, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn both_manifest_shapes_are_read() {
+        // Verbatim shape of a manifest the shipped installer wrote: a third
+        // header, no blank line, and a mode in front of every path.
+        let vendor = "name=e2ei/11/IS_12.1.0.0.938/integrationServer/PIECore/x/BM_Core\n\
+                      version=12.1.0.0.938\n\
+                      timestamp=1776417008\n\
+                      0755 IntegrationServer/packages/WmRoot/assets.json\n\
+                      0644 IntegrationServer/packages/WmRoot/a file with spaces.txt\n";
+        let manifest = Manifest::parse(vendor);
+        assert_eq!(manifest.version.as_deref(), Some("12.1.0.0.938"));
+        assert_eq!(
+            manifest.files,
+            vec![
+                "IntegrationServer/packages/WmRoot/assets.json",
+                "IntegrationServer/packages/WmRoot/a file with spaces.txt",
+            ]
+        );
+
+        // And what a native install writes: blank line, bare paths.
+        let native = "name=p\nversion=1\n\nIntegrationServer/packages/WmRoot/assets.json\n";
+        assert_eq!(
+            Manifest::parse(native).files,
+            vec!["IntegrationServer/packages/WmRoot/assets.json"]
+        );
+    }
+
+    #[test]
+    fn a_path_is_not_mistaken_for_a_mode() {
+        // Four octal digits and a space is a mode; anything else is the path.
+        assert_eq!(strip_mode("0755 a/b"), "a/b");
+        assert_eq!(strip_mode("0999 a/b"), "0999 a/b");
+        assert_eq!(strip_mode("075 a/b"), "075 a/b");
+        assert_eq!(strip_mode("dir with space/file"), "dir with space/file");
+        assert_eq!(strip_mode("a/b"), "a/b");
+    }
+
+    #[test]
+    fn headers_stop_at_the_blank_line() {
+        // An installed file whose own name begins `version=` must be checked,
+        // not swallowed as a header.
+        let manifest = Manifest::parse("name=p\nversion=1\n\nversion=oddly-named-file\na/b\n");
+        assert_eq!(manifest.product.as_deref(), Some("p"));
+        assert_eq!(manifest.version.as_deref(), Some("1"));
+        assert_eq!(manifest.files, vec!["version=oddly-named-file", "a/b"]);
+    }
+
+    #[test]
+    fn a_product_already_there_at_the_same_version_is_not_reinstalled() {
+        let delta = delta(
+            &[IS_938.to_string(), DEPLOYER.to_string()],
+            &installed(&[IS_938]),
+        );
+        assert_eq!(delta.already_installed, vec![IS_938]);
+        assert_eq!(delta.to_install, vec![DEPLOYER]);
+        assert!(delta.version_changes.is_empty());
+    }
+
+    #[test]
+    fn a_different_version_is_reported_rather_than_silently_overwritten() {
+        // The case that costs fix level: the catalogue's base version laid down
+        // over files Update Manager has patched. It must never land in
+        // `to_install`, which is what actually gets unpacked.
+        let delta = delta(&[IS_940.to_string()], &installed(&[IS_938]));
+        assert!(delta.to_install.is_empty());
+        assert!(delta.already_installed.is_empty());
+        let [change] = &delta.version_changes[..] else {
+            panic!(
+                "expected one version change, got {:?}",
+                delta.version_changes
+            );
+        };
+        assert_eq!(change.component, "integrationServer");
+        assert_eq!(change.installed_version, "12.1.0.0.938");
+        assert_eq!(change.catalog_version, "12.1.0.0.940");
+    }
+
+    #[test]
+    fn an_empty_installation_leaves_the_selection_whole() {
+        let delta = delta(&[IS_938.to_string(), DEPLOYER.to_string()], &installed(&[]));
+        assert_eq!(delta.to_install, vec![IS_938, DEPLOYER]);
+        assert!(delta.version_changes.is_empty());
+    }
+
+    #[test]
+    fn the_same_component_under_another_code_is_a_different_product() {
+        // `integrationServer` under IS and under some other product code are
+        // not the same thing; matching on the component name alone would drop a
+        // genuine install.
+        let other = "e2ei/11/MSC_12.1.0.0.938/integrationServer/integrationServer";
+        let delta = delta(&[other.to_string()], &installed(&[IS_938]));
+        assert_eq!(delta.to_install, vec![other]);
+        assert!(delta.version_changes.is_empty());
+    }
+
+    #[test]
+    fn forcing_installs_the_version_changes_too_and_nothing_else() {
+        let delta = delta(
+            &[IS_940.to_string(), DEPLOYER.to_string(), IS_938.to_string()],
+            &installed(&[IS_938]),
+        );
+        // IS_938 is already there and stays out even when forcing: rewriting a
+        // product with the identical version only risks undoing a fix.
+        assert_eq!(delta.forced(), vec![DEPLOYER, IS_940]);
+    }
 
     #[test]
     fn rejects_entries_that_escape_the_target() {
