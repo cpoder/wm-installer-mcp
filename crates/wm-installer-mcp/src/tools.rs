@@ -23,21 +23,46 @@ pub fn server() -> Server {
             "Installs, provisions and patches IBM webMethods without the setup wizard, and \
              drives the product's own tooling — the p2 director, dbConfigurator.sh, \
              is_instance.sh — for everything the installer lays down.\n\n\
-             HOW TO USE THIS SERVER. Every tool that changes anything defaults to a dry run. \
-             The dry run returns a `settings` list naming each value and whether it came from \
-             the caller or from a default. **Show that list to the user in full, ask whether \
-             the defaults suit them or they want any changed, and only then call again with \
-             `apply: true`.** Never apply on the first call. Ports, instance names, install \
-             locations and target platforms all have defaults that are reasonable and often \
-             wrong for a given site; the user is the only one who knows which.\n\n\
-             Long operations return a job id. Poll it with `job_status`, which reports the \
-             phase, bytes fetched against the total, elapsed time and an estimate of what is \
-             left — relay that to the user rather than leaving them without feedback for four \
-             minutes. A person at a terminal can run `wm-installer-mcp --watch <job-id>` for a \
-             live screen. `diagnose_log` explains a failed run.\n\n\
-             For a selection, `inventory_read` on a reference installation gives the exact \
-             versioned product paths, `native_plan` closes it over its prerequisites and prices \
-             the download, and `native_install` performs it.",
+             HOW TO USE THIS SERVER. Every tool that changes an installation defaults to a dry \
+             run. The dry run returns a `settings` list naming each value and whether it came \
+             from the caller or from a default. **Show that list to the user in full, ask \
+             whether the defaults suit them or they want any changed, and only then call again \
+             with `apply: true`.** Never apply on the first call. Ports, instance names, \
+             install locations and target platforms all have defaults that are reasonable and \
+             often wrong for a given site; the user is the only one who knows which.\n\n\
+             NAMING AN INSTALLATION. `install_register` records one under a short name; every \
+             tool that takes `wm_home` or `install_dir` then accepts that name in place of the \
+             path, and `install` always means a registered name. `install_list` shows what is \
+             registered and what is in each — read live from the installation's own \
+             install/products/*.prop, so it is current rather than remembered. \
+             `config_set` makes a release, platform or installation the default for calls that \
+             omit it. These tools, and the credential ones, change this server's own \
+             configuration rather than an installation, so they take effect immediately; the \
+             two that destroy something take `confirm` instead.\n\n\
+             INSTALLING INTO SOMETHING THAT EXISTS. `native_install` and `native_plan` \
+             subtract what the target already carries. Products present at the same version \
+             are not re-fetched; products present at a *different* version are reported as NOT \
+             performed rather than overwritten, because a .prop records the version a product \
+             was installed at and not its fix level — unpacking a catalogue version over a \
+             patched product replaces corrected files with base-version copies, whichever \
+             version is numerically higher. Relay that list to the user; the route that keeps \
+             the fix level is the Update Manager server, and `force: true` is a last resort.\n\n\
+             CREDENTIALS. The IBM entitlement key is a bearer token. `credential_set` puts it \
+             in an encrypted store under the config directory instead of the client's \
+             configuration file; `credential_list` names what is held and how it is sealed, \
+             never the values. An environment variable of the same meaning still wins, which \
+             is how a single run overrides the machine's store. Values are never returned, \
+             never written into a generated script, and never put in a job wrapper.\n\n\
+             JOBS. Long operations return a job id. Poll it with `job_status`, which reports \
+             the phase, bytes fetched against the total, elapsed time and an estimate of what \
+             is left — relay that rather than leaving the user without feedback for four \
+             minutes. A failed job comes back with the matching failure signature, its cause \
+             and remedy, the job directory and the tail of the log, all in the text. A person \
+             at a terminal can run `wm-installer-mcp --watch <job-id>` for a live screen. \
+             `config_show` says where jobs, caches and configuration live.\n\n\
+             For a selection, `catalog_search` finds exact versioned paths and says which are \
+             already installed, `native_plan` closes the selection over its prerequisites and \
+             prices the difference, and `native_install` performs it.",
         )
         .tool(crate::native::sdc_releases())
         .tool(crate::native::sdc_catalog())
@@ -101,7 +126,50 @@ fn installer_bin(args: &Value) -> Result<PathBuf, ToolError> {
 
 use crate::native::jobs_dir;
 
-fn load_catalog(args: &Value) -> Result<(PathBuf, Catalog), ToolError> {
+/// A cached product tree to check the installer binary against.
+///
+/// Deliberately offline: a pre-flight check that needs credentials and a
+/// network round trip is a check that gets skipped exactly when it would have
+/// helped. Trees are cached as `<sandbox>-<platform>.tree`, so when one tree is
+/// cached for the platform in play there is no ambiguity about which release
+/// this machine works with. When there are several, the check reports the
+/// binary's own version and leaves the comparison alone rather than guessing.
+pub(crate) fn cached_catalog(args: &Value) -> Option<Catalog> {
+    cached_catalog_with_path(args).map(|(catalog, _)| catalog)
+}
+
+/// Refuse to start a run the download centre will reject for the client's age.
+///
+/// The rejection happens a minute in, after the product list has been fetched,
+/// and reads like a network failure. Checking first costs a 64 KiB read.
+fn preflight_installer(args: &Value, installer: &Path) -> Result<client::Check, ToolError> {
+    let check =
+        client::check(Some(installer), cached_catalog(args).as_ref()).map_err(ToolError::failed)?;
+    if check.outdated && !flag(args, "skip_version_check", false) {
+        return Err(ToolError::failed(format!(
+            "refusing to start: {}\n\nPass skip_version_check=true to run it anyway — the \
+             comparison is against the installer infrastructure version the catalogue \
+             declares, which is evidence and not a statement from the server.",
+            check.warning().unwrap_or_default()
+        )));
+    }
+    Ok(check)
+}
+
+/// The catalogue a planning call searches, and what went into it.
+///
+/// An installation's own `.prop` files describe what is installed and nothing
+/// else, so a seed naming a product that merely *exists* — the usual case when
+/// planning an addition — resolved to nothing, and the answer read as though the
+/// product were not real: "2 seed(s) match no product" for two perfectly valid
+/// 12.1 products, with the release catalogue sitting in the cache unconsulted.
+/// The installation's entries still win, because its versions are the ones on
+/// disk; the cached release tree supplies everything else.
+///
+/// The sources are returned so a miss can say where it looked. A search that
+/// does not name the haystack makes the reader guess whether the product is
+/// absent or the catalogue is.
+fn load_catalog(args: &Value) -> Result<(PathBuf, Catalog, Vec<String>), ToolError> {
     let home = wm_home(args)?;
     let installed = Catalog::load(&home).map_err(ToolError::failed)?;
     let mut sources = vec![format!(
@@ -287,7 +355,7 @@ fn catalog_search() -> Tool {
             }
         }),
         Box::new(|args| {
-            let (_, catalog) = load_catalog(args)?;
+            let (_, catalog, sources) = load_catalog(args)?;
             let query = req_str(args, "query")?.to_lowercase();
             let limit = opt_usize(args, "limit").unwrap_or(50);
             let hits: Vec<Value> = catalog
@@ -311,11 +379,12 @@ fn catalog_search() -> Tool {
                 .collect();
             Ok(ToolResult::structured(
                 format!(
-                    "{} of {} products match {query:?}",
+                    "{} of {} products match {query:?}; {already} already installed, {} \
+                     available to add.\nsearched:\n{}",
                     hits.len(),
                     catalog.len()
                 ),
-                json!({ "matches": hits }),
+                json!({ "matches": hits, "searched": sources }),
             ))
         }),
                 "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
@@ -336,11 +405,14 @@ fn plan_resolve() -> Tool {
             "properties": {
                 "wm_home": { "type": "string" },
                 "seeds": { "type": "array", "items": { "type": "string" }, "description": "Component names (TNServer) or full versioned paths. A path absent from the catalogue is kept verbatim and reported, since some installed products have no .prop file." },
+                "platform": { "type": "string", "description": "Platform whose cached release catalogue to search alongside the installation's own (default LNXAMD64)." },
+                "release_catalog": { "type": "boolean", "description": "Search the cached release catalogue as well as the installation, so products that exist but are not installed can be found (default true)." },
                 "include_mandatory": { "type": "boolean", "description": "Inject the mandatory base products (default true)." }
             }
         }),
         Box::new(|args| {
-            let (_, catalog) = load_catalog(args)?;
+            let (home, catalog, sources) = load_catalog(args)?;
+            let installed = Catalog::load(&home).map_err(ToolError::failed)?;
             let seeds = str_list(args, "seeds");
             if seeds.is_empty() {
                 return Err(ToolError::invalid("seeds is empty"));
@@ -360,6 +432,7 @@ fn plan_resolve() -> Tool {
                 resolution.len(),
                 added
             );
+                        "installed": installed.contains(&p.path.raw),
             if !seeds.external.is_empty() {
                 "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
                 summary.push_str(&format!(
@@ -369,8 +442,14 @@ fn plan_resolve() -> Tool {
             }
             if !seeds.unresolved.is_empty() {
                 summary.push_str(&format!(
-                    "; {} seed(s) match no product",
-                    seeds.unresolved.len()
+                    "; {} seed(s) match no product ({}) in:\n{}",
+                    seeds.unresolved.len(),
+                    seeds.unresolved.join(", "),
+                    sources
+                        .iter()
+                        .map(|s| format!("  {s}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                 ));
             }
             if !resolution.unsatisfied.is_empty() {
@@ -399,6 +478,8 @@ fn plan_resolve() -> Tool {
                     "install_products": resolution.paths(),
                     "external_paths": seeds.external,
                     "unresolved_seeds": seeds.unresolved,
+                "platform": { "type": "string", "description": "Platform whose cached release catalogue to search alongside the installation's own (default LNXAMD64)." },
+                "release_catalog": { "type": "boolean", "description": "Search the cached release catalogue as well as the installation, so products that exist but are not installed can be found (default true)." },
                     "unsatisfied": resolution.unsatisfied,
                     "caveats": resolution.caveats,
                 }),
@@ -459,6 +540,7 @@ fn script_generate() -> Tool {
                 ),
                 products,
                 extra: Default::default(),
+                    "searched": sources,
                 preamble: vec![
                     "generated by wm-installer-mcp".into(),
                     "$NAME$ placeholders are substituted from the environment at read time".into(),

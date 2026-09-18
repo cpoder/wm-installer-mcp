@@ -158,6 +158,28 @@ impl Catalog {
     }
 
     /// The directory this catalogue was read from.
+    /// Extend this catalogue with everything `other` has that it does not.
+    ///
+    /// An installation's own `.prop` files are authoritative for what is
+    /// installed — the versions in them are the ones on disk — but they say
+    /// nothing about products that are merely *available*, so a selection naming
+    /// one resolves to nothing at all. Planning an addition needs both: this
+    /// catalogue's entries win on conflict, and the release tree supplies the
+    /// rest.
+    pub fn extended_with(mut self, other: &Catalog) -> Self {
+        for product in other.iter() {
+            self.by_path
+                .entry(product.path.raw.clone())
+                .or_insert_with(|| product.clone());
+        }
+        self
+    }
+
+    /// Whether this catalogue carries `path` exactly.
+    pub fn contains(&self, path: &str) -> bool {
+        self.by_path.contains_key(path)
+    }
+
     pub fn source(&self) -> &Path {
         &self.source
     }
