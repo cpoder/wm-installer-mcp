@@ -14,6 +14,7 @@
 //! base products — is decided here, before a process is started.
 
 pub mod catalog;
+pub mod client;
 pub mod config;
 pub mod database;
 pub mod deps;
@@ -26,6 +27,7 @@ pub mod inventory;
 pub mod password;
 pub mod profile;
 pub mod progress;
+pub mod registry;
 pub mod resolve;
 pub mod runner;
 pub mod script;

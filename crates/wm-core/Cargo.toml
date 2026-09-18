@@ -18,6 +18,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11"
 thiserror = { workspace = true }
+time = { version = "0.3", features = ["formatting"] }
 ureq = { version = "3", features = ["json"] }
 zip = { version = "7", default-features = false, features = ["deflate"] }
 

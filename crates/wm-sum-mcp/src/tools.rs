@@ -46,7 +46,13 @@ fn sum_home(args: &Value) -> Result<PathBuf, ToolError> {
     let path = opt_str(args, "sum_home")
         .or_else(|| std::env::var("WM_SUM_HOME").ok())
         .map(PathBuf::from)
-        .ok_or_else(|| ToolError::invalid("no sum_home given and WM_SUM_HOME is not set"))?;
+        .or(from_registry)
+        .or_else(|| std::env::var("WM_SUM_HOME").map(PathBuf::from).ok())
+        .ok_or_else(|| {
+            ToolError::invalid(
+                "no sum_home given, no registered installation named, and WM_SUM_HOME is not set",
+            )
+        })?;
     if !path.join("bin").join("UpdateManagerCMD.sh").is_file() {
         return Err(ToolError::invalid(format!(
             "{} does not look like an Update Manager home (no bin/UpdateManagerCMD.sh)",
@@ -55,12 +61,34 @@ fn sum_home(args: &Value) -> Result<PathBuf, ToolError> {
     }
     Ok(path)
 }
+    // A registered installation records the Update Manager home that patches
+    // it, which is the one fact about SUM that is per-installation rather than
+    // per-machine.
+    let from_registry = opt_str(args, "install")
+        .and_then(|name| wm_core::registry::get(&name).ok())
+        .and_then(|i| i.sum_home);
 
 fn install_dir(args: &Value) -> Result<PathBuf, ToolError> {
-    opt_str(args, "install_dir")
+    if let Some(name) = opt_str(args, "install") {
+        return wm_core::registry::get(&name)
+            .map(|i| i.wm_home)
+            .map_err(ToolError::invalid);
+    }
+    let given = opt_str(args, "install_dir")
         .or_else(|| std::env::var("WM_HOME").ok())
-        .map(PathBuf::from)
-        .ok_or_else(|| ToolError::invalid("no install_dir given and WM_HOME is not set"))
+        .or_else(|| {
+            wm_core::config::Defaults::load()
+                .ok()
+                .and_then(|d| d.install)
+        })
+        .ok_or_else(|| {
+            ToolError::invalid(
+                "no installation named: pass install_dir (a path or a registered name) or \
+                 install (a registered name), or set $WM_HOME",
+            )
+        })?;
+    // A path or a registered name, as everywhere else.
+    wm_core::registry::resolve(&given).map_err(ToolError::invalid)
 }
 
 /// Write a generated script to a private scratch file.
@@ -101,6 +129,7 @@ fn fixes_installed() -> Tool {
         }),
         Box::new(|args| {
             let sum = sum_home(args)?;
+                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
             let target = install_dir(args)?;
             let locks = sum::stale_locks(&sum);
             if !locks.is_empty() {
@@ -216,6 +245,7 @@ fn fix_script_generate() -> Tool {
                 "empower_user": { "type": "string", "description": "Defaults to $WM_EMPOWER_USER." },
                 "sum_home": { "type": "string" },
                 "write_to": { "type": "string", "description": "Also write the script here." }
+                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
             }
         }),
         Box::new(|args| {
@@ -260,6 +290,7 @@ fn fix_run() -> Tool {
         Box::new(|args| {
             let sum = sum_home(args)?;
             let script = req_str(args, "script")?;
+                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
             if !Path::new(&script).is_file() {
                 return Err(ToolError::invalid(format!("no script at {script}")));
             }
@@ -334,6 +365,7 @@ fn sum_locks() -> Tool {
         Box::new(|args| {
             let sum = sum_home(args)?;
             let locks = sum::stale_locks(&sum);
+                "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
             let remove = flag(args, "remove", false);
             let mut removed = Vec::new();
             if remove {

@@ -15,6 +15,7 @@
 //! | `WM_HOME` | default reference installation for catalogue lookups |
 //! | `WM_JOBS_DIR` | where long-running jobs keep their logs (default `~/.wm-mcp/jobs`) |
 
+mod manage;
 mod native;
 mod tools;
 

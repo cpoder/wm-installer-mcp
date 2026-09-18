@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use mcp_rt::args::{flag, opt_str, opt_usize, req_str, str_list};
 use mcp_rt::{Tool, ToolError, ToolResult};
 use serde_json::{json, Value};
+use wm_core::inventory::Inventory;
+use wm_core::registry;
 use wm_core::sdc::{self, Session};
 use wm_core::tree::ProductTree;
 use wm_core::{deps, install, profile, runner};
@@ -43,7 +45,126 @@ fn credentials() -> Result<(String, String), ToolError> {
 fn host(args: &Value) -> String {
     opt_str(args, "host")
         .or_else(|| std::env::var("WM_SDC_HOST").ok())
+        .or_else(|| defaults().host)
         .unwrap_or_else(|| sdc::DEFAULT_HOST.to_string())
+}
+
+/// The stored defaults, or an empty set when they cannot be read.
+///
+/// A malformed config file must not take every tool down with it; the tools
+/// that manage the file report the parse error properly.
+fn defaults() -> wm_core::config::Defaults {
+    wm_core::config::Defaults::load().unwrap_or_default()
+}
+
+/// The release identifier, from the call or from the stored default.
+fn release_arg(args: &Value) -> Result<String, ToolError> {
+    opt_str(args, "release")
+        .or_else(|| defaults().release)
+        .ok_or_else(|| {
+            ToolError::invalid(
+                "no release given and none is configured; call sdc_releases to see what this \
+                 account is entitled to, or set one with config_set",
+            )
+        })
+}
+
+/// The platform code, from the call, the stored default, or Linux x86-64.
+fn platform_arg(args: &Value) -> String {
+    // Upper-cased because the catalogue's codes are — LNXAMD64, W64, AIX — and
+    // the cache is keyed by the string given. `lnxamd64` was quietly producing
+    // a second copy of the same 2 MB tree under a second name.
+    opt_str(args, "platform")
+        .or_else(|| defaults().platform)
+        .unwrap_or_else(|| "LNXAMD64".into())
+        .to_uppercase()
+}
+
+/// Pick the release the caller meant out of what the account is entitled to.
+///
+/// The same release has four names depending on where it was last seen: `12.1`
+/// from `sdc_releases`, `webM121` from the name of the cached tree file,
+/// `2026_May` as the release code, and a display name. They are one release,
+/// and rejecting three of them costs a round trip that discovers nothing. When
+/// nothing matches, the error lists what the account actually has — the old
+/// "no entitlement for release webM121" left the caller guessing twice.
+fn pick_release<'a>(
+    releases: &'a [sdc::Release],
+    wanted: &str,
+) -> Result<&'a sdc::Release, ToolError> {
+    let wanted = wanted.trim();
+    let same = |a: &str| a.eq_ignore_ascii_case(wanted);
+    let found = releases
+        .iter()
+        .find(|r| same(&r.release))
+        .or_else(|| releases.iter().find(|r| same(&r.code)))
+        .or_else(|| {
+            releases
+                .iter()
+                .find(|r| r.sandbox().is_some_and(|s| same(&s)))
+        })
+        .or_else(|| releases.iter().find(|r| same(&r.display_name)))
+        .or_else(|| {
+            releases
+                .iter()
+                .find(|r| r.repository().is_some_and(|s| same(&s)))
+        });
+    found.ok_or_else(|| {
+        let known: Vec<String> = releases
+            .iter()
+            .map(|r| match r.sandbox() {
+                Some(sandbox) => format!("{} ({sandbox})", r.release),
+                None => r.release.clone(),
+            })
+            .collect();
+        ToolError::failed(format!(
+            "no entitlement for release {wanted:?}. This account is entitled to: {}",
+            if known.is_empty() {
+                "nothing".to_string()
+            } else {
+                known.join(", ")
+            }
+        ))
+    })
+}
+
+/// The installation a call is aimed at, named either way.
+///
+/// `install` is always a registered name. `install_dir` and `wm_home` may be
+/// either a path or a registered name, so once an installation is registered
+/// its name works everywhere a path used to go.
+fn target_path(args: &Value) -> Result<Option<PathBuf>, ToolError> {
+    if let Some(name) = opt_str(args, "install") {
+        return registry::get(&name)
+            .map(|i| Some(i.wm_home))
+            .map_err(ToolError::invalid);
+    }
+    let Some(given) = opt_str(args, "install_dir").or_else(|| opt_str(args, "wm_home")) else {
+        return Ok(None);
+    };
+    registry::resolve(&given)
+        .map(Some)
+        .map_err(ToolError::invalid)
+}
+
+/// A required installation, named by path or by registration.
+///
+/// The tools that act on an existing installation all take `wm_home`; routing
+/// them through one function is what lets a registered name work in every one of
+/// them rather than in the handful that happened to be updated.
+fn required_home(args: &Value) -> Result<PathBuf, ToolError> {
+    if let Some(name) = opt_str(args, "install") {
+        return registry::get(&name)
+            .map(|i| i.wm_home)
+            .map_err(ToolError::invalid);
+    }
+    registry::resolve(&req_str(args, "wm_home")?).map_err(ToolError::invalid)
+}
+
+/// What the target installation already carries, or `None` when there is no
+/// installation there yet — which is the fresh-install case, not an error.
+fn existing_inventory(path: &Path) -> Option<Inventory> {
+    Inventory::read(path).ok()
 }
 
 fn login(args: &Value) -> Result<Session, ToolError> {
@@ -80,12 +201,18 @@ fn tree_for(
     release: &str,
     platform: &str,
 ) -> Result<(ProductTree, String), ToolError> {
+    // A cached tree names its own sandbox, so planning against one needs no
+    // credentials and no network at all. Only the lookup from a release number
+    // to a sandbox did, and it was enough to make every planning call fail on a
+    // machine whose key had gone — with a 2 MB answer sitting in the cache.
+    if !flag(args, "refresh", false) {
+        if let Some((tree, sandbox)) = cached_tree(release, platform) {
+            return Ok((tree, sandbox));
+        }
+    }
     let session = login(args)?;
     let releases = session.releases().map_err(ToolError::failed)?;
-    let entry = releases
-        .iter()
-        .find(|r| r.release == release)
-        .ok_or_else(|| ToolError::failed(format!("no entitlement for release {release}")))?;
+    let entry = pick_release(&releases, release)?;
     let sandbox = entry
         .sandbox()
         .ok_or_else(|| ToolError::failed(format!("release {release} names no sandbox")))?;
@@ -432,7 +559,7 @@ pub fn instance_create() -> Tool {
             }
         }),
         Box::new(|args| {
-            let wm_home = PathBuf::from(req_str(args, "wm_home")?);
+            let wm_home = required_home(args)?;
             let name = opt_str(args, "name").unwrap_or_else(|| "default".into());
             let options = wm_core::instance::ant::Options {
                 primary_port: opt_port(args, "primary_port")?,
@@ -537,6 +664,7 @@ pub fn instance_create() -> Tool {
                 wm_core::instance::ant::run(&invocation).map_err(ToolError::failed)?;
             if !ok {
                 return Err(ToolError::failed(format!(
+            let register = registry::find_by_home(&install_dir).map(|i| i.name);
                     "is_instance.sh failed:\n{}",
                     tail(&transcript, 25)
                 )));
@@ -584,7 +712,7 @@ pub fn profile_capture() -> Tool {
             }
         }),
         Box::new(|args| {
-            let wm_home = PathBuf::from(req_str(args, "wm_home")?);
+            let wm_home = required_home(args)?;
             let name = req_str(args, "profile")?;
             let output = PathBuf::from(req_str(args, "output")?);
             let manifest =
@@ -628,7 +756,7 @@ pub fn profile_replay() -> Tool {
         }),
         Box::new(|args| {
             let capture = PathBuf::from(req_str(args, "capture")?);
-            let wm_home = PathBuf::from(req_str(args, "wm_home")?);
+            let wm_home = required_home(args)?;
             let name = opt_str(args, "profile");
             let dry_run = !flag(args, "apply", false);
             let done = profile::replay(&capture, &wm_home, name.as_deref(), dry_run)
@@ -681,10 +809,7 @@ pub fn run_install_job(spec_path: &Path) -> Result<(), String> {
     println!("authenticating against {host}");
     let mut session = Session::login(&host, &user, &key).map_err(|e| e.to_string())?;
     let releases = session.releases().map_err(|e| e.to_string())?;
-    let release = releases
-        .iter()
-        .find(|r| r.release == release_wanted)
-        .ok_or_else(|| format!("no entitlement for release {release_wanted}"))?;
+    let release = pick_release(&releases, &release_wanted).map_err(|e| e.to_string())?;
     let sandbox = release.sandbox().ok_or("release names no sandbox")?;
     let repository = release.repository().ok_or("release names no repository")?;
     let cgi = release.cgi().ok_or("release names no CGI")?.to_string();
@@ -845,7 +970,7 @@ pub fn database_plan() -> Tool {
             }
         }),
         Box::new(|args| {
-            let home = PathBuf::from(req_str(args, "wm_home")?);
+            let home = required_home(args)?;
             let database = opt_str(args, "database").unwrap_or_else(|| "postgresql".into());
             let wanted = str_list(args, "components");
             let components = wm_core::database::discover(&home).map_err(ToolError::failed)?;
@@ -914,7 +1039,7 @@ pub fn database_configure() -> Tool {
             }
         }),
         Box::new(|args| {
-            let home = PathBuf::from(req_str(args, "wm_home")?);
+            let home = required_home(args)?;
             let database = req_str(args, "database")?;
             let wanted = str_list(args, "components");
             if wanted.is_empty() {
@@ -1031,9 +1156,10 @@ pub fn profile_provision() -> Tool {
                 "arch": { "type": "string", "description": "Default x86_64." },
                 "apply": { "type": "boolean", "description": "Set true to run; otherwise a dry run." }
             }
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
         }),
         Box::new(|args| {
-            let home = PathBuf::from(req_str(args, "wm_home")?);
+            let home = required_home(args)?;
             let profile = req_str(args, "profile")?;
             let destination = opt_str(args, "destination")
                 .map(PathBuf::from)
@@ -1089,3 +1215,30 @@ pub fn profile_provision() -> Tool {
         }),
     )
 }
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
+    // Keep the registry's component list honest: the installation just changed,
+    // and a snapshot that still describes the state before it is worse than
+    // none. Failing to update it must not fail the install, which succeeded.
+    if let Some(name) = spec.get("register").and_then(Value::as_str) {
+        match wm_core::registry::get(name) {
+            Ok(mut record) => {
+                record.last_job = std::env::var("WM_JOB_DIR").ok().and_then(|d| {
+                    PathBuf::from(d)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                });
+                record.release.get_or_insert(release_wanted.clone());
+                record.platform.get_or_insert(platform.clone());
+                match record.refresh().and_then(|_| record.save()) {
+                    Ok(()) => println!("refreshed the registry record for {name}"),
+                    Err(e) => println!("note: cannot refresh the registry record for {name}: {e}"),
+                }
+            }
+            Err(e) => println!("note: cannot read the registry record for {name}: {e}"),
+        }
+    }
+
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },

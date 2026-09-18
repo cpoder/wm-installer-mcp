@@ -61,10 +61,24 @@ pub fn server() -> Server {
 }
 
 fn wm_home(args: &Value) -> Result<PathBuf, ToolError> {
-    opt_str(args, "wm_home")
+    if let Some(name) = opt_str(args, "install") {
+        return crate::manage::resolve_home(&name);
+    }
+    let given = opt_str(args, "wm_home")
         .or_else(|| std::env::var("WM_HOME").ok())
-        .map(PathBuf::from)
-        .ok_or_else(|| ToolError::invalid("no wm_home given and WM_HOME is not set"))
+        .or_else(|| {
+            wm_core::config::Defaults::load()
+                .ok()
+                .and_then(|d| d.install)
+        })
+        .ok_or_else(|| {
+            ToolError::invalid(
+                "no installation named: pass wm_home (a path or a registered name) or install \
+                 (a registered name), set $WM_HOME, or make one the default with config_set \
+                 setting=install. install_list shows what is registered.",
+            )
+        })?;
+    crate::manage::resolve_home(&given)
 }
 
 fn installer_bin(args: &Value) -> Result<PathBuf, ToolError> {
@@ -87,10 +101,76 @@ use crate::native::jobs_dir;
 
 fn load_catalog(args: &Value) -> Result<(PathBuf, Catalog), ToolError> {
     let home = wm_home(args)?;
-    let catalog = Catalog::load(&home).map_err(ToolError::failed)?;
-    Ok((home, catalog))
+    let installed = Catalog::load(&home).map_err(ToolError::failed)?;
+    let mut sources = vec![format!(
+        "{} ({} products installed)",
+        home.join("install").join("products").display(),
+        installed.len()
+    )];
+    if !flag(args, "release_catalog", true) {
+        return Ok((home, installed, sources));
+    }
+    let Some((release, path)) = cached_catalog_with_path(args) else {
+        sources.push(
+            "no cached release catalogue for this platform — sdc_catalog fetches one, which \
+             is what lets a product that is not installed be planned for"
+                .to_string(),
+        );
+        return Ok((home, installed, sources));
+    };
+    sources.push(format!(
+        "{} ({} products available)",
+        path.display(),
+        release.len()
+    ));
+    Ok((home, installed.extended_with(&release), sources))
 }
 
+/// A cached release catalogue, with the file it came from.
+fn cached_catalog_with_path(args: &Value) -> Option<(Catalog, PathBuf)> {
+    let platform = opt_str(args, "platform")
+        .or_else(|| {
+            wm_core::config::Defaults::load()
+                .ok()
+                .and_then(|d| d.platform)
+        })
+        .unwrap_or_else(|| "LNXAMD64".into())
+        .to_uppercase();
+    let suffix = format!("-{platform}.tree");
+    let mut matching: Vec<PathBuf> = std::fs::read_dir(wm_core::config::catalog_dir())
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(&suffix))
+        })
+        .collect();
+    matching.sort();
+    let path = matching.pop()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some((
+        wm_core::tree::ProductTree::parse(&text).ok()?.catalog(),
+        path,
+    ))
+        .tool(crate::manage::install_register())
+        .tool(crate::manage::install_list())
+        .tool(crate::manage::install_show())
+        .tool(crate::manage::install_forget())
+        .tool(crate::manage::config_show())
+        .tool(crate::manage::config_set())
+        .tool(crate::manage::credential_set())
+        .tool(crate::manage::credential_list())
+        .tool(crate::manage::credential_remove())
+        .tool(crate::manage::installer_check())
+}
+
+/// The installation a call is about.
+///
+/// Three ways to name one, and the point of the registry is that they are
+/// interchangeable: `install` is always a registered name, `wm_home` is a path
+/// or a registered name, and a session that registered one installation and made
+/// it the default need give neither.
 /// What happened to each seed the caller supplied.
 struct Seeds {
     /// Versioned paths to resolve.
@@ -236,6 +316,7 @@ fn catalog_search() -> Tool {
                 json!({ "matches": hits }),
             ))
         }),
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
     )
 }
 
@@ -278,6 +359,7 @@ fn plan_resolve() -> Tool {
                 added
             );
             if !seeds.external.is_empty() {
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
                 summary.push_str(&format!(
                     "; {} path(s) kept but absent from the catalogue, so not closed over",
                     seeds.external.len()
@@ -345,6 +427,7 @@ fn script_generate() -> Tool {
                 "write_to": { "type": "string", "description": "Also write the script to this path." }
             }
         }),
+                "install": { "type": "string", "description": "A registered installation, as an alternative to wm_home; install_list shows the names." },
         Box::new(|args| {
             let install_dir = req_str(args, "install_dir")?;
             let products = str_list(args, "products");
