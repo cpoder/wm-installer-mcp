@@ -428,6 +428,69 @@ pub fn apply(fix: &Fix, wm_home: &Path, options: Options) -> Result<Applied> {
         on_disk.insert(repo.clone(), disk);
     }
 
+    // What Update Manager has recorded. A fix it lists at this level or a
+    // newer one is applied as far as IBM's tooling is concerned. A fix this
+    // one requires that it does not list may have been applied natively, so
+    // that is a warning, not a refusal.
+    match crate::fixregistry::read(wm_home) {
+        Ok(Some(registry)) => {
+            if let (Some(name), Some(version)) = (&fix.name, &fix.version) {
+                if let Some(recorded) = registry.get(name) {
+                    match osgi_version_cmp(&recorded.version, version) {
+                        Ordering::Less => {}
+                        Ordering::Equal => applied.blocked.push(format!(
+                            "Update Manager records {name} {version} as installed{}",
+                            recorded
+                                .installed_at
+                                .as_ref()
+                                .map(|at| format!(" on {at}"))
+                                .unwrap_or_default()
+                        )),
+                        Ordering::Greater => applied.blocked.push(format!(
+                            "Update Manager records {name} at {}, newer than this {version}",
+                            recorded.version
+                        )),
+                    }
+                }
+            }
+            for required in &fix.requires_fixes {
+                let satisfied = registry.get(&required.name).is_some_and(|recorded| {
+                    required.version.as_deref().is_none_or(|minimum| {
+                        osgi_version_cmp(&recorded.version, minimum) != Ordering::Less
+                    })
+                });
+                if !satisfied {
+                    applied.warnings.push(format!(
+                        "this fix requires {}{}, which Update Manager's registry does not list; \
+                         a fix applied natively would not be listed either",
+                        required.name,
+                        required
+                            .version
+                            .as_ref()
+                            .map(|v| format!(" >= {v}"))
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+        }
+        Ok(None) => {
+            if !fix.requires_fixes.is_empty() {
+                applied.warnings.push(format!(
+                    "this fix requires {}; there is no Update Manager registry here to say \
+                     whether they are installed",
+                    fix.requires_fixes
+                        .iter()
+                        .map(|r| r.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        Err(e) => applied
+            .warnings
+            .push(format!("cannot read Update Manager's registry: {e}")),
+    }
+
     let file = fs::File::open(&fix.path).map_err(|e| Error::io(&fix.path, e))?;
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| Error::Exec(format!("{} unreadable: {e}", fix.path.display())))?;
@@ -1706,6 +1769,92 @@ mod tests {
             applied.verification.is_empty(),
             "{:?}",
             applied.verification
+        );
+    }
+
+    /// Write an Update Manager registry generation listing `fixes` as `(id, version)`.
+    fn registry(home: &Home, fixes: &[(&str, &str)]) {
+        let dir = crate::fixregistry::registry_dir(home.path());
+        fs::create_dir_all(&dir).unwrap();
+        let mut xml = String::from("<profile id='self'><units>");
+        for (id, version) in fixes {
+            xml.push_str(&format!(
+                "<unit id='{id}' version='{version}'><properties>\
+                 <property name='com.webmethods.wm.type.fix' value='true'/>\
+                 </properties></unit>"
+            ));
+        }
+        xml.push_str("</units></profile>");
+        let file = fs::File::create(dir.join("1784564816049.profile.gz")).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        gz.write_all(xml.as_bytes()).unwrap();
+        gz.finish().unwrap();
+    }
+
+    #[test]
+    fn a_fix_update_manager_recorded_is_refused() {
+        // The repository level alone would let this fix through (features on
+        // disk are older), but Update Manager's registry says the fix is on:
+        // someone reinstalled the product underneath, or the repository was
+        // restored. Trust the registry.
+        let home = Home::new("recorded");
+        home.repository("12.1.0.0001-0731", &[("com.example.a", "1.0.0", b"a1")]);
+        home.profile("SPM", &[("com.example.a", "1.0.0", b"a1")]);
+        registry(
+            &home,
+            &[
+                ("wMFix.Test", "12.1.0.0003-0779"),
+                ("wMFix.Other", "12.1.0.0001-0001"),
+            ],
+        );
+        let fix = forged_fix(
+            &home,
+            "12.1.0.0003-0779",
+            "12.1.0.0003-0779",
+            &[("com.example.a", "1.1.0", b"a11")],
+            "",
+        );
+        let applied = apply(&fix, home.path(), APPLY).expect("apply");
+        assert!(!applied.performed);
+        assert!(
+            applied
+                .blocked
+                .iter()
+                .any(|b| b.contains("Update Manager records wMFix.Test")),
+            "{:?}",
+            applied.blocked
+        );
+        // The required fix is listed at a sufficient version: no warning about it.
+        assert!(
+            !applied.warnings.iter().any(|w| w.contains("requires")),
+            "{:?}",
+            applied.warnings
+        );
+    }
+
+    #[test]
+    fn a_required_fix_the_registry_lacks_is_a_warning_not_a_refusal() {
+        let home = Home::new("required");
+        home.repository("12.1.0.0001-0731", &[("com.example.a", "1.0.0", b"a1")]);
+        home.profile("SPM", &[("com.example.a", "1.0.0", b"a1")]);
+        // The registry exists but lists the required fix at too old a build.
+        registry(&home, &[("wMFix.Other", "12.1.0.0000-0001")]);
+        let fix = forged_fix(
+            &home,
+            "12.1.0.0003-0779",
+            "12.1.0.0003-0779",
+            &[("com.example.a", "1.1.0", b"a11")],
+            "",
+        );
+        let applied = apply(&fix, home.path(), APPLY).expect("apply");
+        assert!(applied.performed, "{:?}", applied.blocked);
+        assert!(
+            applied
+                .warnings
+                .iter()
+                .any(|w| w.contains("requires wMFix.Other >= 12.1.0.0001")),
+            "{:?}",
+            applied.warnings
         );
     }
 

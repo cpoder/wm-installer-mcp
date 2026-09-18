@@ -134,9 +134,11 @@ fn read_runtimes(wm_home: &Path) -> Vec<Runtime> {
     runtimes
 }
 
-/// Update Manager drops a readme per fix. They are the only on-disk trace that
-/// survives without asking Update Manager itself, so they are a useful
-/// credential-free approximation of "what is patched here".
+/// Update Manager drops a readme per fix: under `install/fix/readme` for
+/// everything it installs itself, and older products keep their own
+/// `updateReadmes`. They are a credential-free approximation of "what is
+/// patched here"; the authoritative answer is Update Manager's registry, read
+/// by [`crate::fixregistry`].
 fn read_fixes(wm_home: &Path) -> Vec<AppliedFix> {
     let mut fixes = Vec::new();
     let mut scan = |dir: PathBuf, scope: &str| {
@@ -153,6 +155,10 @@ fn read_fixes(wm_home: &Path) -> Vec<AppliedFix> {
             }
         }
     };
+    scan(
+        wm_home.join("install").join("fix").join("readme"),
+        "UpdateManager",
+    );
     scan(wm_home.join("updateReadmes"), "suite");
     scan(
         wm_home.join("IntegrationServer").join("updateReadmes"),

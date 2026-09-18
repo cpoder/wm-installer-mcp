@@ -123,21 +123,29 @@ use wm_core::config::jobs_dir;
 fn fixes_installed() -> Tool {
     Tool::new(
         "fixes_installed",
-        "List the fixes installed in a webMethods installation, by running Update Manager's \
-         read-only -viewInstalledFixes. Needs no IBM credentials and changes nothing. Runs to \
-         completion, so it returns the output directly rather than a job id.",
+        "List the fixes Update Manager has recorded as installed, read straight from its \
+         registry (the newest generation under install/fix/profile/…/self.profile): id, \
+         version, product, when each was installed. Needs no credentials, no Update Manager \
+         and no terminal, and changes nothing. That registry is what Update Manager itself \
+         and the IBM fix service consult, so a fix applied natively by fix_apply is not in \
+         it. Pass via_sum=true to run Update Manager's own 'View installed fixes' instead, \
+         which takes minutes and a pseudo-terminal and needs sum_home.",
         json!({
             "type": "object",
             "properties": {
                 "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
-                "sum_home": { "type": "string" },
                 "install_dir": { "type": "string", "description": "Installation to inspect; defaults to $WM_HOME." },
-                "timeout_seconds": { "type": "integer", "description": "Give up after this long (default 600). Update Manager checks for a self-update before answering, so allow minutes." }
+                "via_sum": { "type": "boolean", "description": "Run Update Manager instead of reading its registry (default false)." },
+                "sum_home": { "type": "string", "description": "Update Manager home, needed with via_sum." },
+                "timeout_seconds": { "type": "integer", "description": "With via_sum: give up after this long (default 600). Update Manager checks for a self-update before answering, so allow minutes." }
             }
         }),
         Box::new(|args| {
-            let sum = sum_home(args)?;
             let target = install_dir(args)?;
+            if !flag(args, "via_sum", false) {
+                return fixes_from_registry(&target);
+            }
+            let sum = sum_home(args)?;
             let locks = sum::stale_locks(&sum);
             if !locks.is_empty() {
                 return Err(ToolError::failed(format!(
@@ -208,6 +216,49 @@ fn fixes_installed() -> Tool {
     )
 }
 
+/// Update Manager's registry of `target`, rendered for a reader.
+fn fixes_from_registry(target: &Path) -> Result<ToolResult, ToolError> {
+    let registry = wm_core::fixregistry::read(target).map_err(ToolError::failed)?;
+    let Some(registry) = registry else {
+        return Ok(ToolResult::structured(
+            format!(
+                "{} has no Update Manager registry ({}): either nothing was ever patched \
+                 with Update Manager, or every fix was applied natively",
+                target.display(),
+                wm_core::fixregistry::REGISTRY_DIR
+            ),
+            json!({ "registry": Value::Null, "fixes": [] }),
+        ));
+    };
+    let patches = registry
+        .fixes
+        .iter()
+        .filter(|f| f.is_support_patch())
+        .count();
+    let mut summary = format!(
+        "{} fix(es) and {} support patch(es) recorded by Update Manager in {} (registry \
+         generation {}, {} kept)",
+        registry.fixes.len() - patches,
+        patches,
+        target.display(),
+        registry.timestamp,
+        registry.generations
+    );
+    for fix in &registry.fixes {
+        summary.push_str(&format!(
+            "\n  {:<36} {:<20} {}  {}",
+            fix.id,
+            fix.version,
+            fix.installed_at.as_deref().unwrap_or("-"),
+            fix.display_name.as_deref().unwrap_or("")
+        ));
+    }
+    Ok(ToolResult::structured(
+        summary,
+        json!({ "registry": registry, "fixes": registry.fixes }),
+    ))
+}
+
 /// Build one step from a tool argument object.
 fn step_from(args: &Value) -> Result<FixStep, ToolError> {
     let action_name = req_str(args, "action")?;
@@ -251,7 +302,6 @@ fn fix_script_generate() -> Tool {
                 "image_file": { "type": "string" },
                 "image_platform": { "type": "string", "description": "e.g. LNXAMD64." },
                 "empower_user": { "type": "string", "description": "Defaults to $WM_EMPOWER_USER." },
-                "sum_home": { "type": "string" },
                 "write_to": { "type": "string", "description": "Also write the script here." }
             }
         }),
@@ -291,7 +341,6 @@ fn fix_run() -> Tool {
             "properties": {
                 "script": { "type": "string", "description": "Path to the script." },
                 "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
-                "sum_home": { "type": "string" },
                 "with_credentials": { "type": "boolean", "description": "Pass IBM credentials (default true; set false for offline actions)." }
             }
         }),
@@ -366,7 +415,6 @@ fn sum_locks() -> Tool {
             "type": "object",
             "properties": {
                 "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
-                "sum_home": { "type": "string" },
                 "remove": { "type": "boolean", "description": "Delete them (default false). Make sure no Update Manager process is running." }
             }
         }),

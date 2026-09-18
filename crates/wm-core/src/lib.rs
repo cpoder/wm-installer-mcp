@@ -21,6 +21,7 @@ pub mod deps;
 pub mod diag;
 pub mod fix;
 pub mod fixes;
+pub mod fixregistry;
 pub mod install;
 pub mod instance;
 pub mod inventory;

@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 time = { version = "0.3", features = ["formatting"] }
 ureq = { version = "3", features = ["json"] }
 zip = { version = "7", default-features = false, features = ["deflate"] }
+flate2 = "1"
 
 [target."cfg(unix)".dependencies]
 libc = { workspace = true }

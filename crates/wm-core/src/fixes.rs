@@ -6,15 +6,23 @@
 //! target product, size and prerequisites.
 //!
 //! Both halves are reproducible here. The inventory is read off the
-//! installation's own `.prop` files; the request is a plain authenticated POST:
+//! installation's own `.prop` files and off Update Manager's registry of
+//! installed fixes ([`crate::fixregistry`]); the request is a plain
+//! authenticated POST:
 //!
 //! ```text
 //! POST /services/sum-repository-service/repositories/<fixRepo>/fixes?showAll=<bool>
 //! X-IBM-wMSUM-P2-SCHEMA: WM
 //! { "envVariables": { "platform": "LNXAMD64", "platformGroup": ["LNXAMD64"], … },
 //!   "installedProducts": [ { "productId": "TNS", "version": "12.1.0.0.139", … } ],
-//!   "installedFixes": [], "installedSupportPatches": [] }
+//!   "installedFixes": [ { "id": "wMFix.TPS.SharedBundles", "version": "12.1.0.0001-0731" } ],
+//!   "installedSupportPatches": [] }
 //! ```
+//!
+//! Without `installedFixes` the service answers as if nothing were patched
+//! and offers every fix again, so the registry read is what makes "what am I
+//! missing" mean what it says. A fix applied natively is not in that registry
+//! and is offered again until something records it.
 //!
 //! The asymmetry between `platform` (a string) and `platformGroup` (an array) is
 //! not a typo: the service rejects the request either way round.
@@ -38,8 +46,19 @@ pub struct Inventory {
     pub update_manager_version: String,
     /// Installed products.
     pub products: Vec<InventoryProduct>,
-    /// Fix ids already applied.
-    pub installed_fixes: Vec<String>,
+    /// Fixes Update Manager records as installed.
+    pub installed_fixes: Vec<InstalledFixRef>,
+    /// Support patches (diagnostic collectors, test patches, hotfixes) it records.
+    pub installed_support_patches: Vec<InstalledFixRef>,
+}
+
+/// One installed fix, as the service wants to hear about it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InstalledFixRef {
+    /// Unit id, e.g. `wMFix.TPS.SharedBundles`.
+    pub id: String,
+    /// Fix version, e.g. `12.1.0.0001-0731`.
+    pub version: String,
 }
 
 /// One installed product in an inventory.
@@ -72,12 +91,28 @@ impl Inventory {
                 display_name: p.path.component.clone(),
             })
             .collect();
+        // Update Manager's own record is the only thing the service
+        // recognises; readmes and backups do not count.
+        let recorded = crate::fixregistry::read(install_dir)?
+            .map(|r| r.fixes)
+            .unwrap_or_default();
+        let refs = |patches: bool| -> Vec<InstalledFixRef> {
+            recorded
+                .iter()
+                .filter(|f| f.is_support_patch() == patches)
+                .map(|f| InstalledFixRef {
+                    id: f.id.clone(),
+                    version: f.version.clone(),
+                })
+                .collect()
+        };
         Ok(Self {
             platform: platform.to_string(),
             hostname: hostname(),
             update_manager_version: "12.0.0.0008".to_string(),
             products,
-            installed_fixes: Vec::new(),
+            installed_fixes: refs(false),
+            installed_support_patches: refs(true),
         })
     }
 
@@ -92,7 +127,7 @@ impl Inventory {
             },
             "installedProducts": self.products,
             "installedFixes": self.installed_fixes,
-            "installedSupportPatches": [],
+            "installedSupportPatches": self.installed_support_patches,
         })
     }
 }
@@ -484,6 +519,7 @@ mod tests {
                 display_name: "TNServer".into(),
             }],
             installed_fixes: Vec::new(),
+            installed_support_patches: Vec::new(),
         };
         let body = inventory.to_request();
         // platform is a string, platformGroup an array; the service rejects

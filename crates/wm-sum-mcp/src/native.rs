@@ -157,8 +157,10 @@ pub fn fixes_inventory() -> Tool {
             let inventory = Inventory::read(&target, &platform).map_err(ToolError::failed)?;
             Ok(ToolResult::structured(
                 format!(
-                    "{} products from {}; inferred release {}",
+                    "{} products and {} fix(es) recorded by Update Manager from {}; inferred \
+                     release {}",
                     inventory.products.len(),
+                    inventory.installed_fixes.len(),
                     target.display(),
                     release_of(&target).unwrap_or_else(|| "unknown".into())
                 ),
