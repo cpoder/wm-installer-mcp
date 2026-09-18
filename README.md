@@ -104,16 +104,16 @@ An installation is registered under a short name, and every tool that takes a
 `wm_home` or an `install_dir` then accepts that name where the path used to go.
 
 ```console
-$ install_register name=wm12 wm_home=/home/cpo/wm12 release=12.1
+$ install_register name=b2b wm_home=/opt/webmethods release=12.1
 
-registered wm12 -> /home/cpo/wm12 (165 products, 4 runtime(s), 19 fix readme(s))
+registered b2b -> /opt/webmethods (165 products, 4 runtime(s), 19 fix readme(s))
 
-$ catalog_search install=wm12 query=deployer
+$ catalog_search install=b2b query=deployer
 
 4 of 394 products match "deployer"; 3 already installed, 1 available to add.
 searched:
-  /home/cpo/wm12/install/products (165 products installed)
-  /home/cpo/.wm-mcp/catalog/webM121-LNXAMD64.tree (394 products available)
+  /opt/webmethods/install/products (165 products installed)
+  ~/.wm-mcp/catalog/webM121-LNXAMD64.tree (394 products available)
 ```
 
 A record holds what the installation does not say about itself — the release,
@@ -142,7 +142,7 @@ that job's log go".
 `native_install` reads the target before it unpacks anything.
 
 ```console
-$ native_plan release=12.1 products='["Deployer","acdl"]' install=wm12
+$ native_plan release=12.1 products='["Deployer","acdl"]' install=b2b
 
 16 of 65 products to install (49 already present at these versions),
 17 artifacts, 58 MB to download — against the whole closure's 957 MB
@@ -174,7 +174,7 @@ something the installation visibly contains, and nothing anywhere says a step is
 missing.
 
 ```console
-$ instance_update install=wm12
+$ instance_update install=b2b
 
 instance default is missing 3 package(s) the installation carries:
   WmBrokerDeployer
@@ -195,13 +195,13 @@ A package the repository does not hold is refused before the script runs, and
 the refusal looks for it elsewhere:
 
 ```console
-$ instance_update install=wm12 packages='["WmDeployerResource"]'
+$ instance_update install=b2b packages='["WmDeployerResource"]'
 
-a package is not in /home/cpo/wm12/IntegrationServer/packages: WmDeployerResource.
+a package is not in /opt/webmethods/IntegrationServer/packages: WmDeployerResource.
 …
 But it does ship, published by another package for distribution rather than held
 in the repository:
-  /home/cpo/wm12/IntegrationServer/packages/WmDeployer/pub/WmDeployerResource.zip
+  /opt/webmethods/IntegrationServer/packages/WmDeployer/pub/WmDeployerResource.zip
 A package that arrives this way is not installed by is_instance.sh at all.
 ```
 
@@ -212,9 +212,9 @@ incremental plan trusts. `install/bms/*.contents` records every path that was
 written, and `install_verify` reads it back.
 
 ```console
-$ install_verify install=wm12
+$ install_verify install=b2b
 
-/home/cpo/wm12: 287 artifact(s), 38212 declared path(s).
+/opt/webmethods: 287 artifact(s), 38212 declared path(s).
 685 absent — 305 superseded by a newer file, 380 unaccounted for.
 ```
 
