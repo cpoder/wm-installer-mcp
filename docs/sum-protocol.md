@@ -30,9 +30,12 @@ What a script does **not** remove is the terminal. Measured on 12.0.0.0008 with
 So the answers must arrive **on a terminal, and after the prompt is on screen**.
 The remaining driver is small, though, precisely because the values come from the
 script: there is nothing to match, only pages to advance. `runner::run_console`
-gives the child a pty via `script(1)`, watches the transcript, and sends one empty
-line each time the output has been quiet — accepting the displayed default, which
-at the navigation prompt is `N` for Next.
+allocates a pseudo-terminal with `openpty`, makes it the child's controlling
+terminal, watches the transcript, and sends one empty line each time the output
+has been quiet — accepting the displayed default, which at the navigation prompt
+is `N` for Next. On a timeout it signals the child's whole process group:
+`UpdateManagerCMD.sh` is a script that starts a JVM, and killing the script
+alone left the JVM running with its lock files held.
 
 ## Command line
 

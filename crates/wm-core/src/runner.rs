@@ -676,6 +676,44 @@ mod tests {
         assert_eq!(out.output.trim(), "unset", "{:?}", out.output);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_console_run_takes_its_grandchildren_with_it() {
+        // The launcher forks a sleeper and waits, the way UpdateManagerCMD.sh
+        // forks a JVM. Killing the launcher alone would leave the sleeper.
+        let marker = std::env::temp_dir().join(format!("wm-core-grandchild-{}", unique_suffix()));
+        let script = format!("sleep 60 & echo $! > {}; wait", marker.display());
+        let out = run_console(
+            Path::new("/bin/sh"),
+            &["-c".into(), script],
+            &Environment::default(),
+            &Console::default(),
+            Duration::from_secs(1),
+        )
+        .expect("run");
+        assert!(out.timed_out);
+        let pid: i32 = fs::read_to_string(&marker)
+            .expect("the grandchild wrote its pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        // Gone, or a zombie waiting to be reaped: either way not running.
+        let mut running = true;
+        for _ in 0..30 {
+            let state = fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+            running = match state {
+                None => false,
+                Some(stat) => !stat.contains(") Z"),
+            };
+            if !running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!running, "grandchild {pid} survived the timeout");
+        let _ = fs::remove_file(&marker);
+    }
+
     #[test]
     fn a_stored_secret_reaches_the_job_without_touching_the_wrapper() {
         // The whole reason `secret_env` is not just another `extra`: `extra`
@@ -935,7 +973,28 @@ pub fn run_console(
         }
 
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => {
+                // What the program wrote in its last moments may still sit in
+                // the pty: drain it, or the line that says why it stopped is
+                // the one that goes missing.
+                for _ in 0..10 {
+                    let mut drained = false;
+                    loop {
+                        match master_file.read(&mut buffer) {
+                            Ok(n) if n > 0 => {
+                                transcript.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                                drained = true;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if !drained {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                break Some(status);
+            }
             Err(e) => {
                 return Err(Error::Exec(format!(
                     "waiting on {}: {e}",
@@ -967,8 +1026,7 @@ pub fn run_console(
     };
 
     if status.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_group(&mut child);
     }
     // A pty echoes input and terminates lines with CRLF; normalise so callers
     // and pattern matching see ordinary text.
@@ -990,6 +1048,33 @@ pub fn run_console(
             })
         }
     }
+}
+
+/// Stop a child that leads its own session, and everything it started.
+///
+/// `Child::kill` signals one process. Update Manager's launcher is a shell
+/// script that starts a JVM: killing the script left the JVM running with its
+/// lock files held, the next run refused to start on those locks, and clearing
+/// them would have let two runs write the same installation. The child was put
+/// in a session of its own by `setsid`, so its process group is its pid and
+/// the signal reaches the whole tree. SIGTERM first, SIGKILL for whatever is
+/// still there three seconds later.
+#[cfg(unix)]
+fn kill_group(child: &mut std::process::Child) {
+    let pgid = child.id() as libc::pid_t;
+    // SAFETY: killpg takes a process-group id and a signal number; no memory
+    // is shared with the callee.
+    unsafe { libc::killpg(pgid, libc::SIGTERM) };
+    let grace = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < grace {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // SAFETY: as above.
+    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    let _ = child.wait();
 }
 
 /// Allocate a pseudo-terminal pair.

@@ -97,11 +97,14 @@ pub struct FixStep {
     pub action: Action,
     /// The webMethods installation to act on (`installDir`).
     pub install_dir: String,
-    /// Fixes to select. Empty means "all applicable".
+    /// Fixes to select, as Update Manager displays them.
     ///
-    /// Leaving this empty for [`Action::CreateImage`] is a trap worth knowing:
-    /// Update Manager warns *"By not selecting any fix ... will create only
-    /// launcher image"* and produces an image with no fixes in it.
+    /// Empty does **not** mean "all applicable". For the install actions
+    /// Update Manager answers *"Empty selectedFixes found in the silent script
+    /// file. Performing only self-update"* and installs nothing; for
+    /// [`Action::CreateImage`] it warns *"By not selecting any fix ... will
+    /// create only launcher image"* and produces an image with no fixes in it.
+    /// Both are caught by [`FixStep::validate`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub selected_fixes: Vec<String>,
     /// Image path for the image-based actions.
@@ -171,6 +174,25 @@ impl FixStep {
             problems.push(
                 "no fixes selected: Update Manager would build a launcher-only image".to_string(),
             );
+        }
+        let needs_fixes = matches!(
+            self.action,
+            Action::InstallFromEmpower
+                | Action::InstallFromImage
+                | Action::InstallFromCache
+                | Action::Uninstall
+        );
+        if needs_fixes && self.selected_fixes.is_empty() {
+            problems.push(format!(
+                "no fixes selected: with an empty selectedFixes Update Manager performs only \
+                 its self-update and does not {} anything. Name them as fixes_available lists \
+                 them",
+                if self.action == Action::Uninstall {
+                    "uninstall"
+                } else {
+                    "install"
+                }
+            ));
         }
         if self.action.needs_credentials()
             && self.empower_user.is_none()
@@ -296,28 +318,76 @@ impl SumCommand {
     }
 }
 
-/// A lock left behind by a previous run.
+/// A lock file of Update Manager's.
 ///
-/// Update Manager exits with 211 and says nothing when either file is present,
-/// which is a common cause of "it worked yesterday".
+/// Update Manager exits with 211 and says nothing when one of its own is
+/// present, which is a common cause of "it worked yesterday". It takes a POSIX
+/// lock on the file while it runs, so a lock file can be told apart from a
+/// running Update Manager: [`StaleLock::held`] says whether a live process
+/// still holds it, in which case deleting the file would let two runs write
+/// the same installation.
 #[derive(Debug, Clone, Serialize)]
 pub struct StaleLock {
     /// Path of the lock file.
     pub path: PathBuf,
+    /// Whether a live process holds a lock on it right now. False for a file
+    /// left behind by a run that is over.
+    pub held: bool,
 }
 
-/// Find the lock files a previous Update Manager run may have left.
-pub fn stale_locks(sum_home: &Path) -> Vec<StaleLock> {
-    [
+/// Find the lock files a previous Update Manager run may have left: the two
+/// under its own home, and the one it puts in the installation it works on.
+pub fn stale_locks(sum_home: &Path, install_dir: Option<&Path>) -> Vec<StaleLock> {
+    let mut candidates = vec![
         sum_home.join("bin").join(".lock"),
         sum_home
             .join("UpdateManager")
             .join("SumAlreadyRunning.lock"),
-    ]
-    .into_iter()
-    .filter(|p| p.exists())
-    .map(|path| StaleLock { path })
-    .collect()
+    ];
+    if let Some(dir) = install_dir {
+        candidates.push(dir.join("SumWorksOnThisDir.lock"));
+    }
+    candidates
+        .into_iter()
+        .filter(|p| p.exists())
+        .map(|path| StaleLock {
+            held: lock_held(&path),
+            path,
+        })
+        .collect()
+}
+
+/// Whether another process holds a POSIX lock on `path`.
+///
+/// Java's `FileChannel.tryLock`, which Update Manager uses, is an `fcntl`
+/// record lock on Linux; `F_GETLK` reports the conflicting lock without
+/// taking one. A file this process cannot open is reported as not held.
+#[cfg(unix)]
+fn lock_held(path: &Path) -> bool {
+    use std::os::unix::io::AsRawFd as _;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
+        return false;
+    };
+    let mut probe = libc::flock {
+        l_type: libc::F_WRLCK as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    // SAFETY: F_GETLK reads the descriptor's lock state into `probe`, a
+    // properly initialised struct that outlives the call.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) };
+    rc == 0 && probe.l_type != libc::F_UNLCK as libc::c_short
+}
+
+#[cfg(not(unix))]
+fn lock_held(_path: &Path) -> bool {
+    false
 }
 
 /// One section of `bin/result.json`.
@@ -447,6 +517,46 @@ mod tests {
         assert!(!Action::ViewInstalled.needs_credentials());
         assert!(Action::InstallFromEmpower.needs_credentials());
         assert!(step(Action::ViewInstalled).validate().is_empty());
+    }
+
+    #[test]
+    fn an_install_step_without_fixes_is_a_problem() {
+        // Measured on 12.0.0.0008: an empty selectedFixes makes Update
+        // Manager perform only its self-update, exit -1 from the client, and
+        // install nothing. It is not "all applicable".
+        let mut s = step(Action::InstallFromEmpower);
+        s.empower_user = Some("user@example.com".into());
+        assert!(s.validate().iter().any(|p| p.contains("self-update")));
+        s.selected_fixes = vec!["IBM webMethods Adapter 6.5 for MQ Fix 53".into()];
+        assert!(s.validate().is_empty(), "{:?}", s.validate());
+
+        let u = step(Action::Uninstall);
+        assert!(u
+            .validate()
+            .iter()
+            .any(|p| p.contains("uninstall anything")));
+    }
+
+    #[test]
+    fn a_lock_file_nobody_holds_is_stale_and_the_installation_lock_is_seen() {
+        let base = std::env::temp_dir().join(format!("wm-sum-locks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sum = base.join("sum");
+        let home = base.join("wm");
+        std::fs::create_dir_all(sum.join("bin")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(sum.join("bin").join(".lock"), b"").unwrap();
+        std::fs::write(home.join("SumWorksOnThisDir.lock"), b"").unwrap();
+
+        let locks = stale_locks(&sum, Some(&home));
+        assert_eq!(locks.len(), 2, "{locks:?}");
+        assert!(locks.iter().all(|l| !l.held), "{locks:?}");
+        assert!(locks
+            .iter()
+            .any(|l| l.path.ends_with("SumWorksOnThisDir.lock")));
+        // Without the installation, only Update Manager's own are reported.
+        assert_eq!(stale_locks(&sum, None).len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

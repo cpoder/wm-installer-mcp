@@ -172,11 +172,18 @@ install.phase5=extract(include:PlatformManager/**/*);\
 osgiCleanCache(profiles:SPM);
 ```
 
-The vocabulary, from Update Manager's own action bundles: `extract`, `copy`,
-`move`, `delete`, `replace`, `backup`, `jar`, `update`, and the OSGi family
-`osgiShutdown`, `osgiCleanCache`, `osgiInstall`, `osgiInstallIU`,
-`osgiUninstall`, `osgiUninstallIU`, `osgiUpdate`, `osgiPublish`,
-`osgiPlatformInstall`, `osgiPlatformUninstall`, `p2`.
+The vocabulary, read from the `plugin.xml` of Update Manager's own action
+bundles, is about a hundred verbs. The file actions are `extract`,
+`extractNoBackup`, `extractRepo`, `delete`, `replace`, `setProperty`,
+`deleteProperty`, `createSymLink`, `removeSymLink`, `startScript` and
+`addUninstallAction`; the OSGi family is `osgiShutdown`, `osgiCleanCache`,
+`osgiInstall`, `osgiInstallIU`, `osgiUninstall`, `osgiUninstallIU`,
+`osgiUpdate`, `osgiPublish`, `osgiPlatformInstall`, `osgiPlatformUninstall`,
+`modifyWrapperConf` and `modifySetenvScript`; the rest are per-product
+(`installISPackage`, `mwsUpdate`, `restartBroker`, …). Two things Update
+Manager adds without writing them in the recipe: for a 12.1 fix that names
+`P2-Repositories`, an `extractRepo` per repository in phase 4, and for an
+empty phase 3, the target product's own shutdown action.
 
 `wm_core::fix` performs the file actions and the profile update:
 

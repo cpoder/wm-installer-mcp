@@ -205,6 +205,17 @@ pub const SIGNATURES: &[Signature] = &[
                  the image.",
     },
     Signature {
+        id: "sum-empty-selected-fixes",
+        tool: Tool::UpdateManager,
+        exit_code: None,
+        patterns: &["Empty selectedFixes found"],
+        cause: "The script names no fix. An empty selectedFixes does not mean every \
+                applicable fix: Update Manager performs only its self-update and installs \
+                nothing, reporting it in bin/result.json.",
+        remedy: "Put the fixes to install in selectedFixes, as fixes_available lists them, \
+                 and run the script again.",
+    },
+    Signature {
         id: "sum-auth-failure",
         tool: Tool::UpdateManager,
         exit_code: Some(25),

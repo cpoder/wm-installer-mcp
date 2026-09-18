@@ -146,7 +146,7 @@ fn fixes_installed() -> Tool {
                 return fixes_from_registry(&target);
             }
             let sum = sum_home(args)?;
-            let locks = sum::stale_locks(&sum);
+            let locks = sum::stale_locks(&sum, Some(&target));
             if !locks.is_empty() {
                 return Err(ToolError::failed(format!(
                     "a previous run left {} lock file(s); Update Manager would exit 211 without \
@@ -266,53 +266,94 @@ fn fixes_from_registry(target: &Path) -> Result<ToolResult, ToolError> {
 }
 
 /// Build one step from a tool argument object.
-fn step_from(args: &Value) -> Result<FixStep, ToolError> {
+/// The `UserInput` keys a step may carry beyond the common ones, and the
+/// argument each comes from. Names are Update Manager's, spelled as its
+/// `ScriptingSession` registers them.
+const EXTRA_KEYS: &[(&str, &str)] = &[
+    ("backup_delete_period", "backupDeletePeriod"),
+    ("period_type", "periodType"),
+    ("install_sp", "installSP"),
+    ("sp_key", "spKey"),
+    ("diagnoser_key", "diagnoserKey"),
+    ("use_ssl", "useSSL"),
+];
+
+/// Build one step from a tool argument object. `defaults` supplies what the
+/// object leaves out, so a batch names the installation once.
+fn step_from(args: &Value, defaults: &Value) -> Result<FixStep, ToolError> {
     let action_name = req_str(args, "action")?;
     let action = Action::parse(&action_name)
         .ok_or_else(|| ToolError::invalid(format!("unknown action {action_name:?}")))?;
+    let pick = |key: &str| opt_str(args, key).or_else(|| opt_str(defaults, key));
+    let target = if opt_str(args, "install").is_some() || opt_str(args, "install_dir").is_some() {
+        install_dir(args)?
+    } else {
+        install_dir(defaults)?
+    };
+    let mut extra = std::collections::BTreeMap::new();
+    for (arg, key) in EXTRA_KEYS {
+        if let Some(value) = pick(arg) {
+            extra.insert((*key).to_string(), value);
+        }
+    }
     Ok(FixStep {
         action,
-        install_dir: install_dir(args)?.display().to_string(),
+        install_dir: target.display().to_string(),
         selected_fixes: str_list(args, "fixes"),
-        image_file: opt_str(args, "image_file"),
-        image_platform: opt_str(args, "image_platform"),
-        empower_user: opt_str(args, "empower_user")
-            .or_else(|| std::env::var("WM_EMPOWER_USER").ok()),
+        image_file: pick("image_file"),
+        image_platform: pick("image_platform"),
+        empower_user: pick("empower_user").or_else(|| std::env::var("WM_EMPOWER_USER").ok()),
         // Never put a key in the script: Update Manager wants it encrypted and
         // rejects plaintext. fix_run passes it on the command line instead.
         empower_password_encrypted: None,
-        extra: Default::default(),
+        extra,
     })
 }
 
 fn fix_script_generate() -> Tool {
     Tool::new(
         "fix_script_generate",
-        "Generate an unattended Update Manager script. One step, or several in one file — \
-         more than one switches on batch mode with numeric key prefixes. Validates first: it \
-         catches the create-image-with-no-fixes case that silently produces a launcher-only \
-         image, and the batch limit of nine steps.",
+        "Generate an unattended Update Manager script: one step from the top-level arguments, \
+         or several from `steps`, which switches on batch mode with numeric key prefixes. \
+         Validates first: an install or uninstall step must name its fixes (with an empty \
+         selectedFixes Update Manager performs only its self-update and does nothing else), \
+         an image step without fixes would produce a launcher-only image, and a batch holds \
+         at most nine steps.",
         json!({
             "type": "object",
-            "required": ["action"],
             "properties": {
                 "action": {
                     "type": "string",
                     "enum": ["install_from_empower", "install_from_image", "install_from_cache",
                              "create_image", "view_installed", "view_available",
-                             "create_inventory", "uninstall", "revert", "delete_backup"]
+                             "create_inventory", "uninstall", "revert", "delete_backup"],
+                    "description": "The step's action, when generating a single step."
                 },
+                "steps": { "type": "array", "items": { "type": "object" }, "description": "Several steps, each an object with the same keys as the top level (action, fixes, image_file, …); the top-level values are the defaults for what a step leaves out." },
                 "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
                 "install_dir": { "type": "string" },
-                "fixes": { "type": "array", "items": { "type": "string" }, "description": "Fix names; empty means all applicable." },
+                "fixes": { "type": "array", "items": { "type": "string" }, "description": "Fix names as Update Manager displays them (fixes_available lists them). Required for the install and uninstall actions: an empty selectedFixes is not 'all applicable'." },
                 "image_file": { "type": "string" },
                 "image_platform": { "type": "string", "description": "e.g. LNXAMD64." },
                 "empower_user": { "type": "string", "description": "Defaults to $WM_EMPOWER_USER." },
+                "backup_delete_period": { "type": "string", "description": "For delete_backup: how old a backup must be, 0 to 999." },
+                "period_type": { "type": "string", "description": "For delete_backup: Days, Weeks or Months." },
+                "install_sp": { "type": "string", "description": "true to install a support patch rather than fixes." },
+                "sp_key": { "type": "string", "description": "Support patch key." },
+                "diagnoser_key": { "type": "string", "description": "Diagnostic collector key." },
+                "use_ssl": { "type": "string" },
                 "write_to": { "type": "string", "description": "Also write the script here." }
             }
         }),
         Box::new(|args| {
-            let script = FixScript::single(step_from(args)?);
+            let steps: Vec<FixStep> = match args.get("steps").and_then(Value::as_array) {
+                Some(items) if !items.is_empty() => items
+                    .iter()
+                    .map(|item| step_from(item, args))
+                    .collect::<Result<_, _>>()?,
+                _ => vec![step_from(args, args)?],
+            };
+            let script = FixScript { steps };
             let problems = script.validate();
             let rendered = script.render();
             if let Some(path) = opt_str(args, "write_to") {
@@ -320,12 +361,13 @@ fn fix_script_generate() -> Tool {
             }
             Ok(ToolResult::structured(
                 if problems.is_empty() {
-                    "script is consistent".to_string()
+                    format!("script is consistent ({} step(s))", script.steps.len())
                 } else {
                     format!("{} problem(s): {}", problems.len(), problems.join("; "))
                 },
                 json!({
                     "script": rendered,
+                    "steps": script.steps.len(),
                     "problems": problems,
                     "written_to": opt_str(args, "write_to"),
                 }),
@@ -359,7 +401,15 @@ fn fix_run() -> Tool {
             if !Path::new(&script).is_file() {
                 return Err(ToolError::invalid(format!("no script at {script}")));
             }
-            let locks = sum::stale_locks(&sum);
+            let target = script_install_dir(Path::new(&script));
+            let locks = sum::stale_locks(&sum, target.as_deref());
+            if let Some(held) = locks.iter().find(|l| l.held) {
+                return Err(ToolError::failed(format!(
+                    "refusing to start: an Update Manager process holds {}; wait for it to \
+                     finish",
+                    held.path.display()
+                )));
+            }
             if !locks.is_empty() {
                 return Err(ToolError::failed(format!(
                     "refusing to start: {} stale lock(s) would make Update Manager exit 211 \
@@ -421,23 +471,33 @@ fn fix_run() -> Tool {
 fn sum_locks() -> Tool {
     Tool::new(
         "sum_locks",
-        "Report — and optionally remove — the lock files a previous Update Manager run leaves \
-         behind. While they exist the next run exits 211 and prints nothing, which is a common \
-         cause of an automation that worked yesterday.",
+        "Report — and optionally remove — Update Manager's lock files: the two under its own \
+         home, and the one it leaves in the installation it worked on. While they exist the \
+         next run exits 211 and prints nothing, which is a common cause of an automation that \
+         worked yesterday. Each is checked for a live holder: a lock a running Update Manager \
+         holds is reported as held and never removed.",
         json!({
             "type": "object",
             "properties": {
                 "install": { "type": "string", "description": "A registered installation (the installer server's install_list shows the names); supplies its path and its recorded sum_home." },
-                "remove": { "type": "boolean", "description": "Delete them (default false). Make sure no Update Manager process is running." }
+                "install_dir": { "type": "string", "description": "Installation whose SumWorksOnThisDir.lock to include; defaults to $WM_HOME when set." },
+                "sum_home": { "type": "string" },
+                "remove": { "type": "boolean", "description": "Delete the stale ones (default false)." }
             }
         }),
         Box::new(|args| {
             let sum = sum_home(args)?;
-            let locks = sum::stale_locks(&sum);
+            let target = install_dir(args).ok();
+            let locks = sum::stale_locks(&sum, target.as_deref());
             let remove = flag(args, "remove", false);
+            let held: Vec<String> = locks
+                .iter()
+                .filter(|l| l.held)
+                .map(|l| l.path.display().to_string())
+                .collect();
             let mut removed = Vec::new();
             if remove {
-                for lock in &locks {
+                for lock in locks.iter().filter(|l| !l.held) {
                     match std::fs::remove_file(&lock.path) {
                         Ok(()) => removed.push(lock.path.display().to_string()),
                         Err(e) => {
@@ -449,17 +509,39 @@ fn sum_locks() -> Tool {
                     }
                 }
             }
-            let summary = match (locks.len(), remove) {
+            let mut summary = match (locks.len(), remove) {
                 (0, _) => "no lock files present".to_string(),
-                (n, false) => format!("{n} lock file(s) present; re-run with remove=true to clear"),
-                (n, true) => format!("{n} lock file(s) removed"),
+                (n, false) => {
+                    format!(
+                        "{n} lock file(s) present; re-run with remove=true to clear the stale ones"
+                    )
+                }
+                (_, true) => format!("{} stale lock file(s) removed", removed.len()),
             };
+            if !held.is_empty() {
+                summary.push_str(&format!(
+                    "; {} held by a running Update Manager and left alone: {}",
+                    held.len(),
+                    held.join(", ")
+                ));
+            }
             Ok(ToolResult::structured(
                 summary,
-                json!({ "locks": locks, "removed": removed }),
+                json!({ "locks": locks, "removed": removed, "held": held }),
             ))
         }),
     )
+}
+
+/// The `installDir` a script names, so the lock it would take in that
+/// installation can be checked before Update Manager starts.
+fn script_install_dir(script: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(script).ok()?;
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        let key = key.trim();
+        (key == "installDir" || key.ends_with(".installDir")).then(|| PathBuf::from(value.trim()))
+    })
 }
 
 fn sum_result() -> Tool {
