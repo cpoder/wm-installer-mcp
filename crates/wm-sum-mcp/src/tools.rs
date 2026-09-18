@@ -178,10 +178,16 @@ fn fixes_installed() -> Tool {
                 Duration::from_secs(opt_usize(args, "timeout_seconds").unwrap_or(600) as u64);
             // A script supplies the values but not the page turns: Update
             // Manager still wants them on a terminal, after each prompt appears.
+            // Listing installed fixes needs no credentials, and Update Manager
+            // copies its environment into its debug log: keep the account out.
+            let env = Environment {
+                scrub: vec![KEY_VAR.to_string(), "WM_EMPOWER_USER".to_string()],
+                ..Environment::default()
+            };
             let output = runner::run_console(
                 &command.program,
                 &command.args,
-                &Environment::default(),
+                &env,
                 &runner::Console::default(),
                 timeout,
             )
@@ -332,9 +338,12 @@ fn fix_run() -> Tool {
     Tool::new(
         "fix_run",
         "Run an Update Manager script (-readScript) as a detached job and return its id. \
-         Credentials are taken from $WM_EMPOWER_USER and $WM_EMPOWER_KEY and passed on the \
-         command line by reference, so the key is never written into the job's wrapper. \
-         Refuses to start when a stale lock is present.",
+         Credentials come from $WM_EMPOWER_USER / $WM_EMPOWER_KEY or the credential store; \
+         the key reaches Update Manager as a command-line argument by reference, is never \
+         written into the job's wrapper, and is removed from the process environment before \
+         Update Manager starts, because Update Manager copies its environment into its \
+         debug log. It is still visible in the process list while the run lasts. Refuses to \
+         start when a stale lock is present.",
         json!({
             "type": "object",
             "required": ["script"],
@@ -385,6 +394,10 @@ fn fix_run() -> Tool {
                     )));
                 }
                 env.passthrough.push(KEY_VAR.to_string());
+                // Update Manager copies its environment into
+                // UpdateManager/logs/debug/*.log, mode 644. The key reaches it
+                // as an argument and is unset before it starts.
+                env.scrub.push(KEY_VAR.to_string());
                 Some((user, format!("${KEY_VAR}")))
             } else {
                 None

@@ -283,20 +283,40 @@ fn to_paths(catalog: &Catalog, seeds: &[String]) -> Seeds {
     out
 }
 
-fn environment(args: &Value) -> Environment {
-    Environment {
+/// Whether a variable name looks like it holds a secret.
+///
+/// `env` values are written to the job's wrapper, which stays on disk for the
+/// life of the job. A name that says "key" or "password" is refused there and
+/// pointed at the two places a secret can go without being written.
+fn looks_secret(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["KEY", "PASS", "PWD", "SECRET", "TOKEN", "CREDENTIAL"]
+        .iter()
+        .any(|needle| upper.contains(needle))
+}
+
+fn environment(args: &Value) -> Result<Environment, ToolError> {
+    let extra: Vec<(String, String)> = args
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some((name, _)) = extra.iter().find(|(name, _)| looks_secret(name)) {
+        return Err(ToolError::invalid(format!(
+            "env would write the value of {name} into the job's wrapper script on disk. Name \
+             it in passthrough_env when this server's environment has it, or store it with \
+             credential_set; env is for placeholders that are not secrets."
+        )));
+    }
+    Ok(Environment {
         tmpdir: opt_str(args, "tmpdir").map(PathBuf::from),
         java_options: opt_str(args, "java_options"),
         disable_cpu_detection_test: flag(args, "disable_cpu_detection_test", false),
-        extra: args
-            .get("env")
-            .and_then(Value::as_object)
-            .map(|map| {
-                map.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        extra,
         stdin_feed: None,
         passthrough: str_list(args, "passthrough_env"),
         // A script's $WM_EMPOWER_KEY$ placeholder resolves from the job's
@@ -304,7 +324,11 @@ fn environment(args: &Value) -> Environment {
         // this process's environment, this is what puts it there — without it
         // ever reaching the wrapper the job runs from.
         secret_env: wm_core::secrets::job_environment(),
-    }
+        // The installer reads its $NAME$ placeholders from the environment, so
+        // nothing is scrubbed here; that is for programs that take a secret as
+        // an argument.
+        scrub: Vec::new(),
+    })
 }
 
 fn inventory_read() -> Tool {
@@ -646,8 +670,11 @@ fn image_build() -> Tool {
         "image_build",
         "Start building an installation image from a script (-writeImage). Runs for tens of \
          minutes and needs roughly twice the image size free in tmpdir, so it returns a job \
-         id to poll with job_status. Credentials come from the environment via the script's \
-         $NAME$ placeholders — pass them in `env`.",
+         id to poll with job_status. The script's $NAME$ placeholders resolve from the job's \
+         environment: name credentials in passthrough_env when this server has them, or store \
+         them with credential_set. `env` is for placeholders that are not secrets — its \
+         values are written to the job's wrapper on disk, and a name that looks like a secret \
+         is refused there.",
         json!({
             "type": "object",
             "required": ["script", "output"],
@@ -659,7 +686,7 @@ fn image_build() -> Tool {
                 "tmpdir": { "type": "string" },
                 "java_options": { "type": "string" },
                 "disable_cpu_detection_test": { "type": "boolean" },
-                "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Variables for the script's $NAME$ placeholders." },
+                "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Variables for the script's $NAME$ placeholders that are not secrets; written to the job's wrapper on disk." },
                 "passthrough_env": { "type": "array", "items": { "type": "string" }, "description": "Variable names this server already has, referenced by the job rather than written into it — use for credentials." },
                 "skip_version_check": { "type": "boolean", "description": "Start even when the installer binary looks older than the catalogue expects." }
             }
@@ -704,7 +731,7 @@ fn image_build() -> Tool {
                 "image",
                 &installer,
                 &cmd_args,
-                &environment(args),
+                &environment(args)?,
             )
             .map_err(ToolError::failed)?;
             let mut summary = format!("image build started as {} -> {output}", job.id);
@@ -745,8 +772,8 @@ fn install_run() -> Tool {
                 "tmpdir": { "type": "string" },
                 "java_options": { "type": "string" },
                 "disable_cpu_detection_test": { "type": "boolean" },
-                "env": { "type": "object", "additionalProperties": { "type": "string" } },
-                "passthrough_env": { "type": "array", "items": { "type": "string" }, "description": "Variable names referenced by the job rather than written into it." },
+                "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Variables for the script's $NAME$ placeholders that are not secrets; written to the job's wrapper on disk." },
+                "passthrough_env": { "type": "array", "items": { "type": "string" }, "description": "Variable names referenced by the job rather than written into it — use for credentials." },
                 "platform": { "type": "string", "description": "Platform whose cached catalogue the installer's version is checked against." },
                 "skip_version_check": { "type": "boolean", "description": "Start even when the installer binary looks older than the catalogue expects." }
             }
@@ -790,7 +817,7 @@ fn install_run() -> Tool {
                 "install",
                 &installer,
                 &cmd_args,
-                &environment(args),
+                &environment(args)?,
             )
             .map_err(ToolError::failed)?;
             let mut summary = format!("installation started as {}", job.id);

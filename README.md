@@ -379,6 +379,14 @@ a bearer token that downloads against the account until it is revoked, and the
 usual homes for it — an MCP client's configuration file, a shell export, a file
 under `/tmp` — are all in clear.
 
+Where the key goes when a job runs: the installer reads it from its
+environment through the script's `$WM_EMPOWER_KEY$` placeholder; Update Manager
+takes it as a command-line argument, and the job's wrapper unsets the variable
+once the argument is expanded, because Update Manager copies its whole
+environment into `UpdateManager/logs/debug/*.log`, mode 644. Neither job's
+wrapper ever holds the value. What remains visible is the argument in the
+process list for the length of an Update Manager run.
+
 ```console
 $ credential_set name=empower.key value=…
 

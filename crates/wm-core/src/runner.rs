@@ -63,6 +63,17 @@ pub struct Environment {
     /// read out of the encrypted store — goes here: the child gets it through
     /// its environment, the wrapper holds only the name.
     pub secret_env: Vec<(String, String)>,
+    /// Variables removed from the program's environment once the command line
+    /// has been expanded.
+    ///
+    /// A program that takes a secret as an argument does not need it in its
+    /// environment as well, and Update Manager copies its whole environment
+    /// into `UpdateManager/logs/debug/*.log`, mode 644, at `debugLevel=DEBUG`.
+    /// Naming a variable here means the wrapper expands `"$NAME"` into the
+    /// argument list and then unsets it, so the value reaches argv and nothing
+    /// else. Not for the installer's `$NAME$` placeholders, which are resolved
+    /// from the environment by the program itself.
+    pub scrub: Vec<String>,
 }
 
 impl Environment {
@@ -134,12 +145,17 @@ pub fn run(
         None => Stdio::null(),
     };
 
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .envs(env.vars())
         .stdin(stdin)
         .stdout(Stdio::from(file))
-        .stderr(Stdio::from(errors))
+        .stderr(Stdio::from(errors));
+    for name in &env.scrub {
+        command.env_remove(name);
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| Error::Exec(format!("cannot run {}: {e}", program.display())))?;
 
@@ -252,13 +268,29 @@ pub fn spawn(
         }
         None => "< /dev/null".to_string(),
     };
+    // The command line is bound with `set --` first, so that a variable named
+    // in `scrub` can be unset between its expansion into an argument and the
+    // program starting: argv keeps the value, the environment does not.
     script.push_str(&format!(
-        "{} {} {} >> {} 2>&1\necho $? > {}\n",
+        "set -- {} {}\n",
         shell_quote(&program.display().to_string()),
         args.iter()
             .map(|a| quote_arg(a, &referenceable))
             .collect::<Vec<_>>()
             .join(" "),
+    ));
+    if !env.scrub.is_empty() {
+        script.push_str(&format!(
+            "unset {}\n",
+            env.scrub
+                .iter()
+                .map(|name| shell_quote(name))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+    script.push_str(&format!(
+        "\"$@\" {} >> {} 2>&1\necho $? > {}\n",
         redirect,
         shell_quote(&log.display().to_string()),
         shell_quote(&exit_file.display().to_string()),
@@ -536,6 +568,7 @@ mod tests {
             stdin_feed: None,
             passthrough: Vec::new(),
             secret_env: Vec::new(),
+            scrub: Vec::new(),
         };
         let vars = env.vars();
         assert!(vars.contains(&("TMPDIR".into(), "/var/tmp/wm".into())));
@@ -577,6 +610,70 @@ mod tests {
             "no assignment written"
         );
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_scrubbed_variable_reaches_the_argument_and_not_the_child() {
+        // Update Manager takes the entitlement key as an argument and then
+        // copies its whole environment into a world-readable debug log. The
+        // wrapper expands the reference into argv and unsets the variable
+        // before the program starts: the value arrives once, as an argument.
+        let base = std::env::temp_dir().join(format!("wm-core-scrub-{}", unique_suffix()));
+        let env = Environment {
+            secret_env: vec![("WM_TEST_SCRUB".to_string(), "arrives-once".to_string())],
+            scrub: vec!["WM_TEST_SCRUB".to_string()],
+            ..Environment::default()
+        };
+        let job = spawn(
+            &base,
+            "scrub",
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "printf '%s|%s' \"$1\" \"${WM_TEST_SCRUB:-unset}\"".into(),
+                "probe".into(),
+                "$WM_TEST_SCRUB".into(),
+            ],
+            &env,
+        )
+        .expect("spawn");
+        let wrapper = fs::read_to_string(job.dir.join("run.sh")).expect("wrapper");
+        assert!(wrapper.contains("unset 'WM_TEST_SCRUB'"), "{wrapper}");
+        assert!(!wrapper.contains("arrives-once"), "{wrapper}");
+        for _ in 0..50 {
+            if matches!(job_state(&job.dir), JobState::Finished { .. }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let out = fs::read_to_string(&job.log).unwrap_or_default();
+        assert_eq!(out.trim(), "arrives-once|unset", "{out:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_synchronous_run_can_scrub_too() {
+        let env = Environment {
+            secret_env: vec![("WM_TEST_SCRUB_SYNC".to_string(), "value".to_string())],
+            scrub: vec!["WM_TEST_SCRUB_SYNC".to_string()],
+            ..Environment::default()
+        };
+        // `run` takes literal arguments and inherits this process's
+        // environment; a scrubbed name is removed from the child's.
+        // SAFETY: tests in this module do not read this variable concurrently.
+        unsafe { std::env::set_var("WM_TEST_SCRUB_SYNC", "value") };
+        let out = run(
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "printf '%s' \"${WM_TEST_SCRUB_SYNC:-unset}\"".into(),
+            ],
+            &env,
+            Duration::from_secs(10),
+        )
+        .expect("run");
+        unsafe { std::env::remove_var("WM_TEST_SCRUB_SYNC") };
+        assert_eq!(out.output.trim(), "unset", "{:?}", out.output);
     }
 
     #[test]
@@ -780,6 +877,9 @@ pub fn run_console(
         .stdin(Stdio::from(child_in))
         .stdout(Stdio::from(child_out))
         .stderr(Stdio::from(child_err));
+    for name in &env.scrub {
+        command.env_remove(name);
+    }
 
     // SAFETY: this closure runs in the forked child between the stdio fds being
     // installed and `exec`. It calls only async-signal-safe functions. `setsid`
